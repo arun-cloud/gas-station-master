@@ -1,0 +1,272 @@
+generator client {
+  provider = "prisma-client"
+  output   = "./generated"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ─── Auth ──────────────────────────────────────────────
+model User {
+  id       String  @id @default(cuid())
+  name     String
+  email    String  @unique
+  password String
+  role     Role    @default(CASHIER)
+  isActive Boolean @default(true)
+
+  branch   Branch? @relation(fields: [branchId], references: [id])
+  branchId String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  sales  Sale[]
+  shifts Shift[]
+}
+
+enum Role {
+  ADMIN
+  MANAGER
+  CASHIER
+}
+
+// ─── Company ─────────────────────────────────────────────
+model Company {
+  id          String @id @default(cuid())
+  nameEn      String
+  nameAr      String
+  legalNameEn String
+  legalNameAr String
+
+  // National Address Fields
+  buildingNo   String
+  street       String
+  district     String
+  city         String
+  postalCode   String
+  additionalNo String? // Often required in KSA National Address
+
+  // Regulatory
+  vatNumber String  @unique // 15 digits
+  crNumber  String  @unique // 10 digits
+  logo      String? // URL to the stored image
+
+  // Relations
+  branches  Branch[]
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// ─── Branches ─────────────────────────────────────────────
+model Branch {
+  id         String @id @default(cuid())
+  nameEn     String
+  nameAr     String
+  branchCode String @unique // Internal identifier (e.g., JED-01)
+
+  // National Address (Branch Specific)
+  buildingNo String
+  street     String
+  district   String
+  city       String
+  postalCode String
+
+  // Relations
+  companyId String
+  company   Company @relation(fields: [companyId], references: [id])
+
+  dispensers Dispenser[]
+  fuelTanks  FuelTank[]
+  users      User[]
+  shifts     Shift[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// ─── Dispensers ─────────────────────────────────────────────
+model Dispenser {
+  id              String          @id @default(cuid())
+  dispenserNumber Int
+  branchId        String
+  status          DispenserStatus @default(IDLE)
+
+  branch  Branch   @relation(fields: [branchId], references: [id])
+  nozzles Nozzle[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  sales     Sale[]
+
+  @@unique([branchId, dispenserNumber])
+}
+
+enum DispenserStatus {
+  IDLE
+  ACTIVE
+  MAINTENANCE
+  OFFLINE
+}
+
+// ─── Nozzles ─────────────────────────────────────────────
+model Nozzle {
+  id             String   @id @default(cuid())
+  nozzleNumber   Int
+  fuelType       FuelType
+  currentReading Decimal  @default(0) @db.Decimal(18, 3)
+  dispenserID    String
+
+  dispenser Dispenser @relation(fields: [dispenserID], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  sales Sale[]
+
+  @@unique([dispenserID, nozzleNumber])
+}
+
+// ─── Fuel Inventory ────────────────────────────────────
+model FuelTank {
+  id           String   @id @default(cuid())
+  tankNumber   Int
+  branchId     String
+  fuelType     FuelType
+  capacity     Decimal
+  currentLevel Decimal
+  minLevel     Decimal // alert threshold
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  deliveries FuelDelivery[]
+  branch     Branch         @relation(fields: [branchId], references: [id])
+
+  @@unique([branchId, tankNumber])
+}
+
+enum FuelType {
+  PETROL_91
+  PETROL_95
+  DIESEL
+  PREMIUM_DIESEL
+}
+
+// ─── Suppliers & Deliveries ────────────────────────────
+model Supplier {
+  id          String   @id @default(cuid())
+  name        String
+  contactName String
+  phone       String
+  email       String?
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+
+  deliveries     FuelDelivery[]
+  purchaseOrders PurchaseOrder[]
+}
+
+model FuelDelivery {
+  id              String   @id @default(cuid())
+  tankId          String
+  supplierId      String
+  purchaseOrderId String
+  litresDelivered Decimal
+  pricePerLitre   Decimal
+  deliveredAt     DateTime @default(now())
+  notes           String?
+
+  tank          FuelTank      @relation(fields: [tankId], references: [id])
+  supplier      Supplier      @relation(fields: [supplierId], references: [id])
+  purchaseOrder PurchaseOrder @relation(fields: [purchaseOrderId], references: [id])
+}
+
+model PurchaseOrder {
+  id           String   @id @default(cuid())
+  supplierId   String
+  status       POStatus @default(PENDING)
+  totalAmount  Decimal
+  expectedDate DateTime
+  createdAt    DateTime @default(now())
+
+  supplier       Supplier       @relation(fields: [supplierId], references: [id])
+  items          POItem[]
+  fuelDeliveries FuelDelivery[]
+}
+
+model POItem {
+  id            String   @id @default(cuid())
+  orderId       String
+  fuelType      FuelType
+  litres        Decimal
+  pricePerLitre Decimal
+
+  order PurchaseOrder @relation(fields: [orderId], references: [id])
+}
+
+enum POStatus {
+  PENDING
+  CONFIRMED
+  DELIVERED
+  CANCELLED
+}
+
+// ─── Sales ─────────────────────────────────────────────
+model Sale {
+  id            String        @id @default(cuid())
+  dispenserId   String
+  userId        String
+  customerId    String?
+  fuelType      FuelType
+  litres        Decimal
+  pricePerLitre Decimal
+  totalAmount   Decimal
+  paymentMethod PaymentMethod
+  createdAt     DateTime      @default(now())
+
+  dispenser Dispenser @relation(fields: [dispenserId], references: [id])
+  user      User      @relation(fields: [userId], references: [id])
+  customer  Customer? @relation(fields: [customerId], references: [id])
+  nozzle    Nozzle?   @relation(fields: [nozzleId], references: [id])
+  nozzleId  String?
+}
+
+enum PaymentMethod {
+  CASH
+  CARD
+  LOYALTY_POINTS
+}
+
+// ─── Customers ─────────────────────────────────────────
+model Customer {
+  id            String   @id @default(cuid())
+  name          String
+  phone         String   @unique
+  email         String?
+  loyaltyPoints Int      @default(0)
+  createdAt     DateTime @default(now())
+
+  sales Sale[]
+}
+
+// ─── Employees & Shifts ────────────────────────────────
+model Shift {
+  id          String      @id @default(cuid())
+  userId      String
+  startTime   DateTime
+  endTime     DateTime?
+  status      ShiftStatus @default(ACTIVE)
+  openingCash Decimal
+  closingCash Decimal?
+  notes       String?
+
+  user     User   @relation(fields: [userId], references: [id])
+  branch   Branch @relation(fields: [branchId], references: [id])
+  branchId String
+}
+
+enum ShiftStatus {
+  ACTIVE
+  CLOSED
+}
