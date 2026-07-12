@@ -1,0 +1,1565 @@
+diff --git a/.env.example b/.env.example
+new file mode 100644
+index 0000000..974ad6f
+--- /dev/null
++++ b/.env.example
+@@ -0,0 +1,18 @@
++# ── Database (Supabase-hosted Postgres) ──────────────────
++# Pooled connection, used at runtime by the app
++DATABASE_URL="postgresql://user:password@host:6543/postgres?pgbouncer=true"
++# Direct (non-pooled) connection, used for migrations/seeding
++DIRECT_URL="postgresql://user:password@host:5432/postgres"
++
++# ── NextAuth ──────────────────────────────────────────────
++# Generate with: openssl rand -base64 32
++NEXTAUTH_SECRET="replace-with-a-generated-32+-character-secret"
++NEXTAUTH_URL="http://localhost:3000"
++
++# ── App ───────────────────────────────────────────────────
++NODE_ENV="development"
++
++# ── Loyverse (reserved for Phase 3 — unused until then) ──
++LOYVERSE_CLIENT_ID=""
++LOYVERSE_CLIENT_SECRET=""
++LOYVERSE_REDIRECT_URI=""
+diff --git a/prisma/migrations/20260713120000_add_user_branch_multi_access/migration.sql b/prisma/migrations/20260713120000_add_user_branch_multi_access/migration.sql
+new file mode 100644
+index 0000000..c6e5b93
+--- /dev/null
++++ b/prisma/migrations/20260713120000_add_user_branch_multi_access/migration.sql
+@@ -0,0 +1,48 @@
++-- Enable pgcrypto for gen_random_uuid() used in the backfill below.
++-- Supabase Postgres has this available by default.
++CREATE EXTENSION IF NOT EXISTS pgcrypto;
++
++-- CreateTable
++CREATE TABLE "UserBranch" (
++    "id" TEXT NOT NULL,
++    "userId" TEXT NOT NULL,
++    "branchId" TEXT NOT NULL,
++    "isPrimary" BOOLEAN NOT NULL DEFAULT false,
++    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
++
++    CONSTRAINT "UserBranch_pkey" PRIMARY KEY ("id")
++);
++
++-- Backfill: move any existing single-branch assignment into the join table
++-- before the old column is dropped. Safe to run even if User.branchId
++-- has no rows or the column doesn't exist yet.
++DO $$
++BEGIN
++  IF EXISTS (
++    SELECT 1 FROM information_schema.columns
++    WHERE table_name = 'User' AND column_name = 'branchId'
++  ) THEN
++    INSERT INTO "UserBranch" ("id", "userId", "branchId", "isPrimary", "createdAt")
++    SELECT gen_random_uuid()::text, "id", "branchId", true, CURRENT_TIMESTAMP
++    FROM "User"
++    WHERE "branchId" IS NOT NULL;
++  END IF;
++END $$;
++
++-- DropForeignKey (old single-branch FK, if present)
++ALTER TABLE "User" DROP CONSTRAINT IF EXISTS "User_branchId_fkey";
++
++-- AlterTable: drop old column, add audit fields, flip isActive default
++ALTER TABLE "User" DROP COLUMN IF EXISTS "branchId";
++ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "createdBy" TEXT;
++ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "updatedBy" TEXT;
++ALTER TABLE "User" ALTER COLUMN "isActive" SET DEFAULT false;
++
++-- CreateIndex
++CREATE UNIQUE INDEX "UserBranch_userId_branchId_key" ON "UserBranch"("userId", "branchId");
++CREATE INDEX "UserBranch_branchId_idx" ON "UserBranch"("branchId");
++CREATE INDEX "User_isActive_idx" ON "User"("isActive");
++
++-- AddForeignKey
++ALTER TABLE "UserBranch" ADD CONSTRAINT "UserBranch_userId_fkey" FOREIGN KEY ("userId") REFERENCES "User"("id") ON DELETE CASCADE ON UPDATE CASCADE;
++ALTER TABLE "UserBranch" ADD CONSTRAINT "UserBranch_branchId_fkey" FOREIGN KEY ("branchId") REFERENCES "Branch"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+diff --git a/prisma/schema.prisma b/prisma/schema.prisma
+index e921229..2e691ab 100644
+--- a/prisma/schema.prisma
++++ b/prisma/schema.prisma
+@@ -14,16 +14,36 @@ model User {
+   email    String  @unique
+   password String
+   role     Role    @default(CASHIER)
+-  isActive Boolean @default(true)
++  isActive Boolean @default(false)
+ 
+-  branch   Branch? @relation(fields: [branchId], references: [id])
+-  branchId String?
++  // Audit: who activated/last modified this account (nullable — self-registration has no actor)
++  createdBy String?
++  updatedBy String?
++
++  userBranches UserBranch[]
+ 
+   createdAt DateTime @default(now())
+   updatedAt DateTime @updatedAt
+ 
+   sales  Sale[]
+   shifts Shift[]
++
++  @@index([isActive])
++}
++
++// ─── User ↔ Branch access (many-to-many) ───────────────
++model UserBranch {
++  id        String   @id @default(cuid())
++  userId    String
++  branchId  String
++  isPrimary Boolean  @default(false)
++  createdAt DateTime @default(now())
++
++  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
++  branch Branch @relation(fields: [branchId], references: [id], onDelete: Cascade)
++
++  @@unique([userId, branchId])
++  @@index([branchId])
+ }
+ 
+ enum Role {
+@@ -77,10 +97,10 @@ model Branch {
+   companyId String
+   company   Company @relation(fields: [companyId], references: [id])
+ 
+-  dispensers Dispenser[]
+-  fuelTanks  FuelTank[]
+-  users      User[]
+-  shifts     Shift[]
++  dispensers   Dispenser[]
++  fuelTanks    FuelTank[]
++  userBranches UserBranch[]
++  shifts       Shift[]
+ 
+   createdAt DateTime @default(now())
+   updatedAt DateTime @updatedAt
+diff --git a/prisma/seed.ts b/prisma/seed.ts
+index 6da8fd9..ef9dad3 100644
+--- a/prisma/seed.ts
++++ b/prisma/seed.ts
+@@ -24,19 +24,6 @@ const prisma = new PrismaClient({ adapter });
+ async function main() {
+   console.log('Seeding database...')
+ 
+-  // Create admin user
+-  const hashedPassword = await bcrypt.hash('admin123', 10)
+-  await prisma.user.upsert({
+-    where: { email: 'admin@gasstation.com' },
+-    update: {},
+-    create: {
+-      name: 'Station Admin',
+-      email: 'admin@gasstation.com',
+-      password: hashedPassword,
+-      role: Role.ADMIN,
+-    },
+-  })
+-
+   const company = await prisma.company.upsert({
+     where: {
+       vatNumber: "300000000000003",
+@@ -110,6 +97,29 @@ async function main() {
+ 
+   console.log(`Branch seeded: ${branch.nameEn}`);
+ 
++  // Create admin user — active immediately (bootstrap account) and attached
++  // to the seeded branch so it can log in and activate other users.
++  const hashedPassword = await bcrypt.hash('admin123', 10)
++  const admin = await prisma.user.upsert({
++    where: { email: 'admin@gasstation.com' },
++    update: { isActive: true },
++    create: {
++      name: 'Station Admin',
++      email: 'admin@gasstation.com',
++      password: hashedPassword,
++      role: Role.ADMIN,
++      isActive: true,
++    },
++  })
++
++  await prisma.userBranch.upsert({
++    where: { userId_branchId: { userId: admin.id, branchId: branch.id } },
++    update: {},
++    create: { userId: admin.id, branchId: branch.id, isPrimary: true },
++  })
++
++  console.log('Admin seeded: admin@gasstation.com / admin123 (CHANGE THIS PASSWORD)');
++
+   const fuelTankData = [
+     {
+       tankNumber: 1,
+diff --git a/src/app/(auth)/layout.tsx b/src/app/(auth)/layout.tsx
+new file mode 100644
+index 0000000..8489d0e
+--- /dev/null
++++ b/src/app/(auth)/layout.tsx
+@@ -0,0 +1,11 @@
++export default function AuthLayout({
++  children,
++}: {
++  children: React.ReactNode
++}) {
++  return (
++    <div className="flex min-h-screen items-center justify-center bg-gray-50 px-4">
++      <div className="w-full max-w-sm">{children}</div>
++    </div>
++  )
++}
+diff --git a/src/app/(auth)/login/page.tsx b/src/app/(auth)/login/page.tsx
+new file mode 100644
+index 0000000..d1f2384
+--- /dev/null
++++ b/src/app/(auth)/login/page.tsx
+@@ -0,0 +1,11 @@
++import LoginForm from '@/components/auth/LoginForm'
++
++export default function LoginPage() {
++  return (
++    <div className="rounded-2xl border border-gray-200 bg-white p-8 shadow-sm">
++      <h1 className="text-xl font-bold text-gray-800">Sign in</h1>
++      <p className="mt-1 text-sm text-gray-500">Fuel Management System</p>
++      <LoginForm />
++    </div>
++  )
++}
+diff --git a/src/app/(auth)/register/page.tsx b/src/app/(auth)/register/page.tsx
+new file mode 100644
+index 0000000..ed6a64b
+--- /dev/null
++++ b/src/app/(auth)/register/page.tsx
+@@ -0,0 +1,13 @@
++import RegisterForm from '@/components/auth/RegisterForm'
++
++export default function RegisterPage() {
++  return (
++    <div className="rounded-2xl border border-gray-200 bg-white p-8 shadow-sm">
++      <h1 className="text-xl font-bold text-gray-800">Create an account</h1>
++      <p className="mt-1 text-sm text-gray-500">
++        Your account will need admin approval before you can sign in.
++      </p>
++      <RegisterForm />
++    </div>
++  )
++}
+diff --git a/src/app/(dashboard)/admin/users/page.tsx b/src/app/(dashboard)/admin/users/page.tsx
+new file mode 100644
+index 0000000..cbf413e
+--- /dev/null
++++ b/src/app/(dashboard)/admin/users/page.tsx
+@@ -0,0 +1,86 @@
++import { prisma } from '@/lib/prisma'
++import { getCurrentUser } from '@/lib/session'
++import { ShieldAlert, UserCog } from 'lucide-react'
++import PendingUserRow from '@/components/admin/PendingUserRow'
++
++export default async function AdminUsersPage() {
++  const user = await getCurrentUser()
++
++  // Defense in depth: middleware already guarantees a logged-in, active
++  // user reached this route. This is the permission (role) check.
++  if (!user) {
++    return null
++  }
++
++  if (user.role !== 'ADMIN' && user.role !== 'MANAGER') {
++    return (
++      <div className="rounded-xl border border-red-200 bg-red-50 p-6 text-center">
++        <ShieldAlert className="mx-auto mb-3 text-red-500" size={32} />
++        <h1 className="text-lg font-semibold text-red-900">
++          Access denied
++        </h1>
++        <p className="mt-1 text-sm text-red-700">
++          Only administrators and managers can manage user accounts.
++        </p>
++      </div>
++    )
++  }
++
++  const [pendingUsers, branches] = await Promise.all([
++    prisma.user.findMany({
++      where: { isActive: false },
++      select: {
++        id: true,
++        name: true,
++        email: true,
++        role: true,
++        createdAt: true,
++      },
++      orderBy: { createdAt: 'asc' },
++    }),
++    prisma.branch.findMany({
++      select: { id: true, nameEn: true },
++      orderBy: { nameEn: 'asc' },
++    }),
++  ])
++
++  return (
++    <div className="space-y-6">
++      <div>
++        <h1 className="text-2xl font-bold text-gray-800">
++          Pending User Activations
++        </h1>
++        <p className="mt-0.5 text-sm text-gray-500">
++          {pendingUsers.length} account
++          {pendingUsers.length === 1 ? '' : 's'} awaiting approval
++        </p>
++      </div>
++
++      {branches.length === 0 ? (
++        <div className="rounded-xl border border-amber-200 bg-amber-50 p-5">
++          <p className="text-sm text-amber-700">
++            Create a branch before activating users — every active user
++            needs at least one branch assignment.
++          </p>
++        </div>
++      ) : pendingUsers.length === 0 ? (
++        <div className="py-16 text-center text-gray-400">
++          <UserCog size={40} className="mx-auto mb-3 opacity-30" />
++          <p className="text-sm">
++            No pending accounts. New self-registrations will appear here.
++          </p>
++        </div>
++      ) : (
++        <div className="space-y-3">
++          {pendingUsers.map((pendingUser) => (
++            <PendingUserRow
++              key={pendingUser.id}
++              user={pendingUser}
++              branches={branches}
++            />
++          ))}
++        </div>
++      )}
++    </div>
++  )
++}
+diff --git a/src/app/(dashboard)/layout.tsx b/src/app/(dashboard)/layout.tsx
+index 899412e..ac42b8b 100644
+--- a/src/app/(dashboard)/layout.tsx
++++ b/src/app/(dashboard)/layout.tsx
+@@ -1,15 +1,21 @@
+ import Sidebar from '@/components/layout/Sidebar'
+ import Topbar from '@/components/layout/Topbar'
++import { requireUser } from '@/lib/rbac'
+ 
+-export default function DashboardLayout({
++export default async function DashboardLayout({
+   children,
+ }: {
+   children: React.ReactNode
+ }) {
++  // Defense in depth: middleware.ts already blocks this route for
++  // unauthenticated/inactive users. This also gives us the user's
++  // name/role/branch context to render.
++  const user = await requireUser()
++
+   return (
+     <div className="flex h-screen bg-gray-50 overflow-hidden">
+       {/* Sidebar — fixed left column */}
+-      <Sidebar />
++      <Sidebar user={{ name: user.name, role: user.role }} />
+ 
+       {/* Main area — takes remaining width */}
+       <div className="flex flex-col flex-1 overflow-hidden">
+diff --git a/src/app/actions/auth.actions.ts b/src/app/actions/auth.actions.ts
+new file mode 100644
+index 0000000..6401b94
+--- /dev/null
++++ b/src/app/actions/auth.actions.ts
+@@ -0,0 +1,73 @@
++'use server'
++
++import { z } from 'zod'
++import bcrypt from 'bcryptjs'
++import { prisma } from '@/lib/prisma'
++
++const registerSchema = z.object({
++  name: z.string().trim().min(2, 'Name must be at least 2 characters').max(100),
++  email: z.string().trim().toLowerCase().email('Enter a valid email address'),
++  password: z.string().min(8, 'Password must be at least 8 characters'),
++})
++
++export type RegisterActionResult = {
++  success: boolean
++  error?: string
++}
++
++/**
++ * Self-registration entry point. Anyone can call this — that's by design.
++ * Security boundary: role and isActive are NEVER taken from client input.
++ * Every self-registered account starts as CASHIER and inactive, and must
++ * be activated (with a role + branch assignment) by an ADMIN or MANAGER
++ * via /admin/users before they can sign in.
++ */
++export async function registerUser(
++  formData: FormData,
++): Promise<RegisterActionResult> {
++  const parsed = registerSchema.safeParse({
++    name: formData.get('name'),
++    email: formData.get('email'),
++    password: formData.get('password'),
++  })
++
++  if (!parsed.success) {
++    return {
++      success: false,
++      error: parsed.error.issues[0]?.message ?? 'Invalid input',
++    }
++  }
++
++  const { name, email, password } = parsed.data
++
++  try {
++    const existing = await prisma.user.findUnique({ where: { email } })
++
++    if (existing) {
++      return {
++        success: false,
++        error: 'An account with this email already exists',
++      }
++    }
++
++    const hashedPassword = await bcrypt.hash(password, 12)
++
++    await prisma.user.create({
++      data: {
++        name,
++        email,
++        password: hashedPassword,
++        role: 'CASHIER',
++        isActive: false,
++      },
++    })
++
++    return { success: true }
++  } catch (error: unknown) {
++    console.error('Failed to register user:', error)
++    return {
++      success: false,
++      error: 'Failed to create account. Please try again.',
++    }
++  }
++}
+diff --git a/src/app/actions/employee.actions.ts b/src/app/actions/employee.actions.ts
+index ec6ffa9..057a103 100644
+--- a/src/app/actions/employee.actions.ts
++++ b/src/app/actions/employee.actions.ts
+@@ -3,19 +3,33 @@
+ import { prisma }         from '@/lib/prisma'
+ import { revalidatePath }  from 'next/cache'
+ import bcrypt              from 'bcryptjs'
++import { requireRole, requireUserOrThrow, ForbiddenError } from '@/lib/rbac'
++import type { Role } from '../../../prisma/generated/client'
++
++const VALID_ROLES: Role[] = ['ADMIN', 'MANAGER', 'CASHIER']
+ 
+ // ── Add employee ────────────────────────────────────────
++// NOTE: this creates the user active immediately (trusted admin/manager
++// context, unlike public self-registration). It does not yet assign a
++// branch — use /admin/users to assign branch access after creation.
++// Branch selection in this form is a follow-up item for Phase 2.
+ export async function addEmployee(formData: FormData) {
+-  const name     = formData.get('name')     as string
+-  const email    = formData.get('email')    as string
+-  const password = formData.get('password') as string
+-  const role     = formData.get('role')     as string
++  try {
++    const actor = await requireRole(['ADMIN', 'MANAGER'])
+ 
+-  if (!name || !email || !password || !role) {
+-    return { success: false, error: 'All fields are required' }
+-  }
++    const name     = formData.get('name')     as string
++    const email    = formData.get('email')    as string
++    const password = formData.get('password') as string
++    const role     = formData.get('role')     as string
++
++    if (!name || !email || !password || !role) {
++      return { success: false, error: 'All fields are required' }
++    }
++
++    if (!VALID_ROLES.includes(role as Role)) {
++      return { success: false, error: 'Select a valid role' }
++    }
+ 
+-  try {
+     const existing = await prisma.user.findUnique({ where: { email } })
+     if (existing) return { success: false, error: 'Email already registered' }
+ 
+@@ -26,14 +40,18 @@ export async function addEmployee(formData: FormData) {
+         name,
+         email,
+         password: hashed,
+-        role:     role as any,
++        role:     role as Role,
+         isActive: true,
++        createdBy: actor.id,
+       },
+     })
+ 
+     revalidatePath('/employees')
+     return { success: true }
+-  } catch {
++  } catch (error: unknown) {
++    if (error instanceof ForbiddenError) {
++      return { success: false, error: error.message }
++    }
+     return { success: false, error: 'Failed to add employee' }
+   }
+ }
+@@ -44,13 +62,18 @@ export async function toggleEmployeeStatus(
+   isActive: boolean
+ ) {
+   try {
++    const actor = await requireRole(['ADMIN', 'MANAGER'])
++
+     await prisma.user.update({
+       where: { id: userId },
+-      data:  { isActive },
++      data:  { isActive, updatedBy: actor.id },
+     })
+     revalidatePath('/employees')
+     return { success: true }
+-  } catch {
++  } catch (error: unknown) {
++    if (error instanceof ForbiddenError) {
++      return { success: false, error: error.message }
++    }
+     return { success: false, error: 'Failed to update status' }
+   }
+ }
+@@ -58,6 +81,8 @@ export async function toggleEmployeeStatus(
+ // ── Clock in ────────────────────────────────────────────
+ export async function clockIn(userId: string, openingCash: number) {
+   try {
++    await requireUserOrThrow()
++
+     // Check no active shift already open
+     const existing = await prisma.shift.findFirst({
+       where: { userId, status: 'ACTIVE' },
+@@ -78,7 +103,10 @@ export async function clockIn(userId: string, openingCash: number) {
+     revalidatePath('/employees')
+     revalidatePath('/employees/shifts')
+     return { success: true }
+-  } catch {
++  } catch (error: unknown) {
++    if (error instanceof ForbiddenError) {
++      return { success: false, error: error.message }
++    }
+     return { success: false, error: 'Failed to clock in' }
+   }
+ }
+@@ -90,6 +118,8 @@ export async function clockOut(
+   notes:       string
+ ) {
+   try {
++    await requireUserOrThrow()
++
+     await prisma.shift.update({
+       where: { id: shiftId },
+       data:  {
+@@ -103,7 +133,10 @@ export async function clockOut(
+     revalidatePath('/employees')
+     revalidatePath('/employees/shifts')
+     return { success: true }
+-  } catch {
++  } catch (error: unknown) {
++    if (error instanceof ForbiddenError) {
++      return { success: false, error: error.message }
++    }
+     return { success: false, error: 'Failed to clock out' }
+   }
+ }
+@@ -114,13 +147,22 @@ export async function updateEmployeeRole(
+   role:   string
+ ) {
+   try {
++    const actor = await requireRole(['ADMIN'])
++
++    if (!VALID_ROLES.includes(role as Role)) {
++      return { success: false, error: 'Select a valid role' }
++    }
++
+     await prisma.user.update({
+       where: { id: userId },
+-      data:  { role: role as any },
++      data:  { role: role as Role, updatedBy: actor.id },
+     })
+     revalidatePath('/employees')
+     return { success: true }
+-  } catch {
++  } catch (error: unknown) {
++    if (error instanceof ForbiddenError) {
++      return { success: false, error: error.message }
++    }
+     return { success: false, error: 'Failed to update role' }
+   }
+ }
+\ No newline at end of file
+diff --git a/src/app/actions/pump.actions copy.ts b/src/app/actions/pump.actions copy.ts
+deleted file mode 100644
+index d05aa61..0000000
+--- a/src/app/actions/pump.actions copy.ts	
++++ /dev/null
+@@ -1,71 +0,0 @@
+-// 'use server'
+-
+-// import { prisma } from '@/lib/prisma'
+-// import { revalidatePath } from 'next/cache'
+-
+-// // ── Update dispenser status ──────────────────────────────────
+-// export async function updatePumpStatus(
+-//   pumpId: string,
+-//   status: 'IDLE' | 'ACTIVE' | 'MAINTENANCE' | 'OFFLINE'
+-// ) {
+-//   try {
+-//     await prisma.pump.update({
+-//       where: { id: pumpId },
+-//       data:  { status },
+-//     })
+-
+-//     // Tell Next.js to refresh the pumps page data
+-//     revalidatePath('/pumps')
+-//     revalidatePath('/dashboard')
+-
+-//     return { success: true }
+-//   } catch (error) {
+-//     return { success: false, error: 'Failed to update pump status' }
+-//   }
+-// }
+-
+-// // ── Update pump reading ─────────────────────────────────
+-// export async function updatePumpReading(
+-//   pumpId: string,
+-//   reading: number
+-// ) {
+-//   try {
+-//     await prisma.pump.update({
+-//       where: { id: pumpId },
+-//       data:  { currentReading: reading },
+-//     })
+-
+-//     revalidatePath('/pumps')
+-//     return { success: true }
+-//   } catch (error) {
+-//     return { success: false, error: 'Failed to update reading' }
+-//   }
+-// }
+-
+-// // ── Add a new pump ──────────────────────────────────────
+-// export async function addPump(formData: FormData) {
+-//   const pumpNumber = Number(formData.get('pumpNumber'))
+-//   const fuelType   = formData.get('fuelType') as string
+-
+-//   // Validate
+-//   if (!pumpNumber || !fuelType) {
+-//     return { success: false, error: 'All fields are required' }
+-//   }
+-
+-//   try {
+-//     await prisma.pump.create({
+-//       data: {
+-//         pumpNumber,
+-//         fuelType:      fuelType as any,
+-//         status:        'IDLE',
+-//         currentReading: 0,
+-//       },
+-//     })
+-
+-//     revalidatePath('/pumps')
+-//     return { success: true }
+-//   } catch (error) {
+-//     // Unique constraint on pumpNumber
+-//     return { success: false, error: 'Pump number already exists' }
+-//   }
+-// }
+\ No newline at end of file
+diff --git a/src/app/actions/user.actions.ts b/src/app/actions/user.actions.ts
+new file mode 100644
+index 0000000..2325ec1
+--- /dev/null
++++ b/src/app/actions/user.actions.ts
+@@ -0,0 +1,90 @@
++'use server'
++
++import { prisma } from '@/lib/prisma'
++import { revalidatePath } from 'next/cache'
++import { requireRole, ForbiddenError } from '@/lib/rbac'
++import type { Role } from '../../../prisma/generated/client'
++
++export type UserActionResult = {
++  success: boolean
++  error?: string
++}
++
++/**
++ * Activate a pending self-registered user: sets isActive=true, assigns
++ * a role, and replaces their branch access with the given branch list.
++ * First branch in the list becomes the primary branch.
++ */
++export async function activateUser(
++  userId: string,
++  branchIds: string[],
++  role: Role,
++): Promise<UserActionResult> {
++  try {
++    const actor = await requireRole(['ADMIN', 'MANAGER'])
++
++    if (!userId) {
++      return { success: false, error: 'User is required' }
++    }
++
++    if (branchIds.length === 0) {
++      return { success: false, error: 'Assign at least one branch' }
++    }
++
++    await prisma.$transaction([
++      prisma.user.update({
++        where: { id: userId },
++        data: {
++          isActive: true,
++          role,
++          updatedBy: actor.id,
++        },
++      }),
++      prisma.userBranch.deleteMany({ where: { userId } }),
++      prisma.userBranch.createMany({
++        data: branchIds.map((branchId, index) => ({
++          userId,
++          branchId,
++          isPrimary: index === 0,
++        })),
++      }),
++    ])
++
++    revalidatePath('/admin/users')
++    revalidatePath('/employees')
++    return { success: true }
++  } catch (error: unknown) {
++    console.error('Failed to activate user:', error)
++    if (error instanceof ForbiddenError) {
++      return { success: false, error: error.message }
++    }
++    return { success: false, error: 'Failed to activate user' }
++  }
++}
++
++/**
++ * Deactivate a user (revokes access without deleting their record —
++ * also used to reject a pending self-registration).
++ */
++export async function deactivateUser(
++  userId: string,
++): Promise<UserActionResult> {
++  try {
++    const actor = await requireRole(['ADMIN', 'MANAGER'])
++
++    await prisma.user.update({
++      where: { id: userId },
++      data: { isActive: false, updatedBy: actor.id },
++    })
++
++    revalidatePath('/admin/users')
++    revalidatePath('/employees')
++    return { success: true }
++  } catch (error: unknown) {
++    console.error('Failed to deactivate user:', error)
++    if (error instanceof ForbiddenError) {
++      return { success: false, error: error.message }
++    }
++    return { success: false, error: 'Failed to deactivate user' }
++  }
++}
+diff --git a/src/app/api/auth/[...nextauth]/route.ts b/src/app/api/auth/[...nextauth]/route.ts
+new file mode 100644
+index 0000000..e10628f
+--- /dev/null
++++ b/src/app/api/auth/[...nextauth]/route.ts
+@@ -0,0 +1,6 @@
++import NextAuth from 'next-auth'
++import { authOptions } from '@/lib/auth'
++
++const handler = NextAuth(authOptions)
++
++export { handler as GET, handler as POST }
+diff --git a/src/app/layout.tsx b/src/app/layout.tsx
+index 77db2c0..2f8208e 100644
+--- a/src/app/layout.tsx
++++ b/src/app/layout.tsx
+@@ -1,5 +1,6 @@
+ import type { Metadata } from 'next'
+ import { Inter } from 'next/font/google'
++import SessionProvider from '@/components/providers/SessionProvider'
+ import './globals.css'
+ 
+ const inter = Inter({ subsets: ['latin'] })
+@@ -17,7 +18,7 @@ export default function RootLayout({
+   return (
+     <html lang="en">
+       <body className={inter.className}>
+-        {children}
++        <SessionProvider>{children}</SessionProvider>
+       </body>
+     </html>
+   )
+diff --git a/src/components/admin/PendingUserRow.tsx b/src/components/admin/PendingUserRow.tsx
+new file mode 100644
+index 0000000..80bff86
+--- /dev/null
++++ b/src/components/admin/PendingUserRow.tsx
+@@ -0,0 +1,126 @@
++'use client'
++
++import { useState, useTransition } from 'react'
++import { activateUser, deactivateUser } from '@/app/actions/user.actions'
++
++type Role = 'ADMIN' | 'MANAGER' | 'CASHIER'
++
++type Branch = {
++  id: string
++  nameEn: string
++}
++
++type PendingUser = {
++  id: string
++  name: string
++  email: string
++  role: Role
++  createdAt: Date
++}
++
++export default function PendingUserRow({
++  user,
++  branches,
++}: {
++  user: PendingUser
++  branches: Branch[]
++}) {
++  const [selectedBranches, setSelectedBranches] = useState<string[]>([])
++  const [role, setRole] = useState<Role>(user.role)
++  const [error, setError] = useState<string | null>(null)
++  const [isPending, startTransition] = useTransition()
++
++  function toggleBranch(branchId: string) {
++    setSelectedBranches((prev) =>
++      prev.includes(branchId)
++        ? prev.filter((id) => id !== branchId)
++        : [...prev, branchId],
++    )
++  }
++
++  function handleActivate() {
++    setError(null)
++    startTransition(async () => {
++      const result = await activateUser(user.id, selectedBranches, role)
++      if (!result.success) {
++        setError(result.error ?? 'Failed to activate user')
++      }
++    })
++  }
++
++  function handleReject() {
++    setError(null)
++    startTransition(async () => {
++      const result = await deactivateUser(user.id)
++      if (!result.success) {
++        setError(result.error ?? 'Failed to reject user')
++      }
++    })
++  }
++
++  return (
++    <div className="rounded-xl border border-gray-200 bg-white p-4">
++      <div className="flex flex-wrap items-center justify-between gap-3">
++        <div>
++          <p className="font-medium text-gray-800">{user.name}</p>
++          <p className="text-sm text-gray-500">{user.email}</p>
++        </div>
++
++        <select
++          value={role}
++          onChange={(e) => setRole(e.target.value as Role)}
++          disabled={isPending}
++          className="rounded-lg border border-gray-300 px-3 py-1.5 text-sm disabled:opacity-50"
++        >
++          <option value="CASHIER">Cashier</option>
++          <option value="MANAGER">Manager</option>
++          <option value="ADMIN">Admin</option>
++        </select>
++      </div>
++
++      <div className="mt-3">
++        <p className="mb-1.5 text-xs font-medium uppercase text-gray-400">
++          Assign branch access
++        </p>
++        <div className="flex flex-wrap gap-2">
++          {branches.map((branch) => (
++            <button
++              key={branch.id}
++              type="button"
++              onClick={() => toggleBranch(branch.id)}
++              disabled={isPending}
++              className={`rounded-full px-3 py-1 text-xs font-medium transition-colors disabled:opacity-50 ${
++                selectedBranches.includes(branch.id)
++                  ? 'bg-amber-500 text-gray-900'
++                  : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
++              }`}
++            >
++              {branch.nameEn}
++            </button>
++          ))}
++        </div>
++      </div>
++
++      {error && <p className="mt-2 text-sm text-red-600">{error}</p>}
++
++      <div className="mt-3 flex justify-end gap-2">
++        <button
++          type="button"
++          onClick={handleReject}
++          disabled={isPending}
++          className="rounded-lg border border-gray-300 px-3 py-1.5 text-sm text-gray-600 hover:bg-gray-50 disabled:opacity-50"
++        >
++          Reject
++        </button>
++        <button
++          type="button"
++          onClick={handleActivate}
++          disabled={isPending || selectedBranches.length === 0}
++          className="rounded-lg bg-amber-500 px-3 py-1.5 text-sm font-medium text-gray-900 hover:bg-amber-600 disabled:opacity-50"
++        >
++          {isPending ? 'Saving...' : 'Activate'}
++        </button>
++      </div>
++    </div>
++  )
++}
+diff --git a/src/components/auth/LoginForm.tsx b/src/components/auth/LoginForm.tsx
+new file mode 100644
+index 0000000..4cf9e07
+--- /dev/null
++++ b/src/components/auth/LoginForm.tsx
+@@ -0,0 +1,96 @@
++'use client'
++
++import { useState } from 'react'
++import { signIn } from 'next-auth/react'
++import { useRouter } from 'next/navigation'
++import Link from 'next/link'
++
++export default function LoginForm() {
++  const router = useRouter()
++  const [email, setEmail] = useState('')
++  const [password, setPassword] = useState('')
++  const [error, setError] = useState<string | null>(null)
++  const [isSubmitting, setIsSubmitting] = useState(false)
++
++  async function handleSubmit(e: React.FormEvent) {
++    e.preventDefault()
++    setError(null)
++    setIsSubmitting(true)
++
++    const result = await signIn('credentials', {
++      email,
++      password,
++      redirect: false,
++    })
++
++    setIsSubmitting(false)
++
++    if (result?.error) {
++      setError(result.error)
++      return
++    }
++
++    router.push('/dashboard')
++    router.refresh()
++  }
++
++  return (
++    <form onSubmit={handleSubmit} className="mt-6 space-y-4">
++      <div>
++        <label
++          htmlFor="email"
++          className="mb-1 block text-sm font-medium text-gray-700"
++        >
++          Email
++        </label>
++        <input
++          id="email"
++          type="email"
++          required
++          autoComplete="email"
++          value={email}
++          onChange={(e) => setEmail(e.target.value)}
++          className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-amber-500"
++        />
++      </div>
++
++      <div>
++        <label
++          htmlFor="password"
++          className="mb-1 block text-sm font-medium text-gray-700"
++        >
++          Password
++        </label>
++        <input
++          id="password"
++          type="password"
++          required
++          autoComplete="current-password"
++          value={password}
++          onChange={(e) => setPassword(e.target.value)}
++          className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-amber-500"
++        />
++      </div>
++
++      {error && <p className="text-sm text-red-600">{error}</p>}
++
++      <button
++        type="submit"
++        disabled={isSubmitting}
++        className="w-full rounded-lg bg-amber-500 py-2 text-sm font-medium text-gray-900 hover:bg-amber-600 disabled:opacity-50"
++      >
++        {isSubmitting ? 'Signing in...' : 'Sign in'}
++      </button>
++
++      <p className="text-center text-sm text-gray-500">
++        Don&apos;t have an account?{' '}
++        <Link
++          href="/register"
++          className="font-medium text-amber-600 hover:underline"
++        >
++          Register
++        </Link>
++      </p>
++    </form>
++  )
++}
+diff --git a/src/components/auth/RegisterForm.tsx b/src/components/auth/RegisterForm.tsx
+new file mode 100644
+index 0000000..8c6b4a4
+--- /dev/null
++++ b/src/components/auth/RegisterForm.tsx
+@@ -0,0 +1,119 @@
++'use client'
++
++import { useState, useTransition } from 'react'
++import Link from 'next/link'
++import { registerUser } from '@/app/actions/auth.actions'
++
++export default function RegisterForm() {
++  const [error, setError] = useState<string | null>(null)
++  const [submitted, setSubmitted] = useState(false)
++  const [isPending, startTransition] = useTransition()
++
++  function handleSubmit(e: React.FormEvent<HTMLFormElement>) {
++    e.preventDefault()
++    setError(null)
++
++    const formData = new FormData(e.currentTarget)
++
++    startTransition(async () => {
++      const result = await registerUser(formData)
++      if (!result.success) {
++        setError(result.error ?? 'Registration failed')
++        return
++      }
++      setSubmitted(true)
++    })
++  }
++
++  if (submitted) {
++    return (
++      <div className="mt-6 rounded-lg border border-amber-200 bg-amber-50 p-4 text-sm text-amber-800">
++        Account created. An administrator needs to activate your account
++        and assign your branch before you can sign in.
++        <div className="mt-3">
++          <Link
++            href="/login"
++            className="font-medium text-amber-700 hover:underline"
++          >
++            Back to sign in
++          </Link>
++        </div>
++      </div>
++    )
++  }
++
++  return (
++    <form onSubmit={handleSubmit} className="mt-6 space-y-4">
++      <div>
++        <label
++          htmlFor="name"
++          className="mb-1 block text-sm font-medium text-gray-700"
++        >
++          Full name
++        </label>
++        <input
++          id="name"
++          name="name"
++          required
++          minLength={2}
++          className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-amber-500"
++        />
++      </div>
++
++      <div>
++        <label
++          htmlFor="email"
++          className="mb-1 block text-sm font-medium text-gray-700"
++        >
++          Email
++        </label>
++        <input
++          id="email"
++          type="email"
++          name="email"
++          required
++          autoComplete="email"
++          className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-amber-500"
++        />
++      </div>
++
++      <div>
++        <label
++          htmlFor="password"
++          className="mb-1 block text-sm font-medium text-gray-700"
++        >
++          Password
++        </label>
++        <input
++          id="password"
++          type="password"
++          name="password"
++          required
++          minLength={8}
++          autoComplete="new-password"
++          className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-amber-500"
++        />
++      </div>
++
++      {error && <p className="text-sm text-red-600">{error}</p>}
++
++      <button
++        type="submit"
++        disabled={isPending}
++        className="w-full rounded-lg bg-amber-500 py-2 text-sm font-medium text-gray-900 hover:bg-amber-600 disabled:opacity-50"
++      >
++        {isPending ? 'Creating account...' : 'Create account'}
++      </button>
++
++      <p className="text-center text-sm text-gray-500">
++        Already have an account?{' '}
++        <Link
++          href="/login"
++          className="font-medium text-amber-600 hover:underline"
++        >
++          Sign in
++        </Link>
++      </p>
++    </form>
++  )
++}
+diff --git a/src/components/layout/Sidebar.tsx b/src/components/layout/Sidebar.tsx
+index 5fcba38..a869ca6 100644
+--- a/src/components/layout/Sidebar.tsx
++++ b/src/components/layout/Sidebar.tsx
+@@ -2,6 +2,7 @@
+ 
+ import Link from 'next/link'
+ import { usePathname } from 'next/navigation'
++import { signOut } from 'next-auth/react'
+ import {
+   LayoutDashboard,
+   Fuel,
+@@ -14,8 +15,17 @@ import {
+   Zap,
+   Plus,
+   Clock,
++  ShieldCheck,
++  LogOut,
+ } from 'lucide-react'
+ 
++type Role = 'ADMIN' | 'MANAGER' | 'CASHIER'
++
++type SidebarUser = {
++  name: string
++  role: Role
++}
++
+ const navItems = [
+   { label: 'Dashboard', href: '/dashboard', icon: LayoutDashboard },
+   { label: 'Dispensers', href: '/dispensers', icon: Fuel },
+@@ -29,9 +39,23 @@ const navItems = [
+   { label: 'Settings', href: '/settings', icon: Settings },
+ ]
+ 
+-export default function Sidebar() {
++const roleLabels: Record<Role, string> = {
++  ADMIN: 'Administrator',
++  MANAGER: 'Manager',
++  CASHIER: 'Cashier',
++}
++
++export default function Sidebar({ user }: { user: SidebarUser }) {
+   const pathname = usePathname()
+ 
++  const items =
++    user.role === 'ADMIN' || user.role === 'MANAGER'
++      ? [
++          ...navItems,
++          { label: 'User Approvals', href: '/admin/users', icon: ShieldCheck },
++        ]
++      : navItems
++
+   return (
+     <aside className="w-60 bg-gray-900 text-white flex flex-col h-full shrink-0">
+ 
+@@ -48,7 +72,7 @@ export default function Sidebar() {
+ 
+       {/* Navigation */}
+       <nav className="flex-1 px-3 py-4 space-y-1">
+-        {navItems.map((item) => {
++        {items.map((item) => {
+           const Icon = item.icon
+ 
+           const isActive =
+@@ -76,12 +100,22 @@ export default function Sidebar() {
+       <div className="px-4 py-4 border-t border-gray-700">
+         <div className="flex items-center gap-3">
+           <div className="w-8 h-8 rounded-full bg-amber-500 flex items-center justify-center text-gray-900 text-xs font-bold">
+-            A
++            {user.name.charAt(0).toUpperCase()}
+           </div>
+-          <div>
+-            <p className="text-sm font-medium text-white">Admin</p>
+-            <p className="text-xs text-gray-400">Administrator</p>
++          <div className="min-w-0 flex-1">
++            <p className="truncate text-sm font-medium text-white">
++              {user.name}
++            </p>
++            <p className="text-xs text-gray-400">{roleLabels[user.role]}</p>
+           </div>
++          <button
++            type="button"
++            onClick={() => signOut({ callbackUrl: '/login' })}
++            className="rounded-lg p-1.5 text-gray-400 hover:bg-gray-800 hover:text-white"
++            title="Sign out"
++          >
++            <LogOut size={16} />
++          </button>
+         </div>
+       </div>
+     </aside>
+diff --git a/src/components/providers/SessionProvider.tsx b/src/components/providers/SessionProvider.tsx
+new file mode 100644
+index 0000000..8bdc2f7
+--- /dev/null
++++ b/src/components/providers/SessionProvider.tsx
+@@ -0,0 +1,11 @@
++'use client'
++
++import { SessionProvider as NextAuthSessionProvider } from 'next-auth/react'
++
++export default function SessionProvider({
++  children,
++}: {
++  children: React.ReactNode
++}) {
++  return <NextAuthSessionProvider>{children}</NextAuthSessionProvider>
++}
+diff --git a/src/lib/auth.ts b/src/lib/auth.ts
+new file mode 100644
+index 0000000..9e3b56b
+--- /dev/null
++++ b/src/lib/auth.ts
+@@ -0,0 +1,82 @@
++import './env'
++import type { NextAuthOptions } from 'next-auth'
++import CredentialsProvider from 'next-auth/providers/credentials'
++import bcrypt from 'bcryptjs'
++import { prisma } from '@/lib/prisma'
++
++export const authOptions: NextAuthOptions = {
++  session: {
++    strategy: 'jwt',
++    maxAge: 60 * 60 * 8, // 8 hours
++  },
++  pages: {
++    signIn: '/login',
++  },
++  providers: [
++    CredentialsProvider({
++      name: 'Credentials',
++      credentials: {
++        email: { label: 'Email', type: 'email' },
++        password: { label: 'Password', type: 'password' },
++      },
++      async authorize(credentials) {
++        if (!credentials?.email || !credentials?.password) {
++          throw new Error('Email and password are required')
++        }
++
++        const user = await prisma.user.findUnique({
++          where: { email: credentials.email.toLowerCase().trim() },
++          include: {
++            userBranches: { select: { branchId: true } },
++          },
++        })
++
++        if (!user) {
++          throw new Error('Invalid email or password')
++        }
++
++        const passwordValid = await bcrypt.compare(
++          credentials.password,
++          user.password,
++        )
++
++        if (!passwordValid) {
++          throw new Error('Invalid email or password')
++        }
++
++        if (!user.isActive) {
++          throw new Error(
++            'Your account is pending activation by an administrator',
++          )
++        }
++
++        return {
++          id: user.id,
++          name: user.name,
++          email: user.email,
++          role: user.role,
++          isActive: user.isActive,
++          branchIds: user.userBranches.map((ub) => ub.branchId),
++        }
++      },
++    }),
++  ],
++  callbacks: {
++    async jwt({ token, user }) {
++      if (user) {
++        token.id = user.id
++        token.role = user.role
++        token.isActive = user.isActive
++        token.branchIds = user.branchIds
++      }
++      return token
++    },
++    async session({ session, token }) {
++      session.user.id = token.id
++      session.user.role = token.role
++      session.user.isActive = token.isActive
++      session.user.branchIds = token.branchIds
++      return session
++    },
++  },
++}
+diff --git a/src/lib/env.ts b/src/lib/env.ts
+new file mode 100644
+index 0000000..e3df9c8
+--- /dev/null
++++ b/src/lib/env.ts
+@@ -0,0 +1,31 @@
++import { z } from 'zod'
++
++const envSchema = z.object({
++  DATABASE_URL: z.string().min(1, 'DATABASE_URL is required'),
++  DIRECT_URL: z.string().min(1).optional(),
++  NEXTAUTH_SECRET: z
++    .string()
++    .min(32, 'NEXTAUTH_SECRET must be at least 32 characters — generate with `openssl rand -base64 32`'),
++  NEXTAUTH_URL: z.string().url().optional(),
++  NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
++})
++
++export type Env = z.infer<typeof envSchema>
++
++function loadEnv(): Env {
++  const parsed = envSchema.safeParse(process.env)
++
++  if (!parsed.success) {
++    console.error(
++      '❌ Invalid environment variables:',
++      parsed.error.flatten().fieldErrors,
++    )
++    throw new Error(
++      'Invalid environment variables. Check your .env against .env.example.',
++    )
++  }
++
++  return parsed.data
++}
++
++export const env = loadEnv()
+diff --git a/src/lib/rbac.ts b/src/lib/rbac.ts
+new file mode 100644
+index 0000000..cf3f005
+--- /dev/null
++++ b/src/lib/rbac.ts
+@@ -0,0 +1,66 @@
++import 'server-only'
++import { redirect } from 'next/navigation'
++import { getCurrentUser } from '@/lib/session'
++import type { Role } from '../../prisma/generated/client'
++
++export class ForbiddenError extends Error {
++  constructor(message = 'You do not have permission to perform this action') {
++    super(message)
++    this.name = 'ForbiddenError'
++  }
++}
++
++/**
++ * Use in Server Components that render a full page.
++ * Redirects to /login when there is no active session.
++ * (Defense in depth — middleware.ts already blocks the route.)
++ */
++export async function requireUser() {
++  const user = await getCurrentUser()
++  if (!user) {
++    redirect('/login')
++  }
++  return user
++}
++
++/**
++ * Use inside Server Actions / Route Handlers, where a redirect would be
++ * the wrong UX — throws instead so the caller can return a typed
++ * { success: false, error } response.
++ */
++export async function requireUserOrThrow() {
++  const user = await getCurrentUser()
++  if (!user) {
++    throw new ForbiddenError('You must be signed in to perform this action')
++  }
++  return user
++}
++
++export async function requireRole(allowedRoles: Role[]) {
++  const user = await requireUserOrThrow()
++  if (!allowedRoles.includes(user.role)) {
++    throw new ForbiddenError(
++      `This action requires one of the following roles: ${allowedRoles.join(', ')}`,
++    )
++  }
++  return user
++}
++
++/**
++ * Ensures the current user has access to the given branch.
++ * ASSUMPTION: ADMIN bypasses branch scoping (company-wide access).
++ * MANAGER/CASHIER must have an explicit UserBranch row.
++ */
++export async function requireBranchAccess(branchId: string) {
++  const user = await requireUserOrThrow()
++
++  if (user.role === 'ADMIN') {
++    return user
++  }
++
++  if (!user.branchIds.includes(branchId)) {
++    throw new ForbiddenError('You do not have access to this branch')
++  }
++
++  return user
++}
+diff --git a/src/lib/session.ts b/src/lib/session.ts
+new file mode 100644
+index 0000000..50c0d82
+--- /dev/null
++++ b/src/lib/session.ts
+@@ -0,0 +1,8 @@
++import 'server-only'
++import { getServerSession } from 'next-auth'
++import { authOptions } from '@/lib/auth'
++
++export async function getCurrentUser() {
++  const session = await getServerSession(authOptions)
++  return session?.user ?? null
++}
+diff --git a/src/middleware.ts b/src/middleware.ts
+new file mode 100644
+index 0000000..456f41c
+--- /dev/null
++++ b/src/middleware.ts
+@@ -0,0 +1,36 @@
++import { withAuth } from 'next-auth/middleware'
++import { NextResponse } from 'next/server'
++
++export default withAuth(
++  function middleware() {
++    return NextResponse.next()
++  },
++  {
++    callbacks: {
++      authorized: ({ token }) => {
++        // Must have a valid token AND an activated account.
++        return !!token && token.isActive === true
++      },
++    },
++    pages: {
++      signIn: '/login',
++    },
++  },
++)
++
++// Protects every dashboard route (including the Server Actions posted to
++// those same routes). Auth pages (/login, /register) and the NextAuth
++// API route are intentionally excluded.
++export const config = {
++  matcher: [
++    '/dashboard/:path*',
++    '/dispensers/:path*',
++    '/fuel/:path*',
++    '/sales/:path*',
++    '/employees/:path*',
++    '/suppliers/:path*',
++    '/reports/:path*',
++    '/settings/:path*',
++    '/admin/:path*',
++  ],
++}
+diff --git a/src/types/next-auth.d.ts b/src/types/next-auth.d.ts
+new file mode 100644
+index 0000000..e8cc694
+--- /dev/null
++++ b/src/types/next-auth.d.ts
+@@ -0,0 +1,34 @@
++import type { Role } from '../../prisma/generated/client'
++import 'next-auth'
++import 'next-auth/jwt'
++
++declare module 'next-auth' {
++  interface Session {
++    user: {
++      id: string
++      name: string
++      email: string
++      role: Role
++      isActive: boolean
++      branchIds: string[]
++    }
++  }
++
++  interface User {
++    id: string
++    name: string
++    email: string
++    role: Role
++    isActive: boolean
++    branchIds: string[]
++  }
++}
++
++declare module 'next-auth/jwt' {
++  interface JWT {
++    id: string
++    role: Role
++    isActive: boolean
++    branchIds: string[]
++  }
++}

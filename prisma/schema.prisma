@@ -14,16 +14,36 @@ model User {
   email    String  @unique
   password String
   role     Role    @default(CASHIER)
-  isActive Boolean @default(true)
+  isActive Boolean @default(false)
 
-  branch   Branch? @relation(fields: [branchId], references: [id])
-  branchId String?
+  // Audit: who activated/last modified this account (nullable — self-registration has no actor)
+  createdBy String?
+  updatedBy String?
+
+  userBranches UserBranch[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   sales  Sale[]
   shifts Shift[]
+
+  @@index([isActive])
+}
+
+// ─── User ↔ Branch access (many-to-many) ───────────────
+model UserBranch {
+  id        String   @id @default(cuid())
+  userId    String
+  branchId  String
+  isPrimary Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  branch Branch @relation(fields: [branchId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, branchId])
+  @@index([branchId])
 }
 
 enum Role {
@@ -77,10 +97,10 @@ model Branch {
   companyId String
   company   Company @relation(fields: [companyId], references: [id])
 
-  dispensers Dispenser[]
-  fuelTanks  FuelTank[]
-  users      User[]
-  shifts     Shift[]
+  dispensers   Dispenser[]
+  fuelTanks    FuelTank[]
+  userBranches UserBranch[]
+  shifts       Shift[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt

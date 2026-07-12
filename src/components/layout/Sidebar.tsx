@@ -2,6 +2,7 @@
 
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
+import { signOut } from 'next-auth/react'
 import {
   LayoutDashboard,
   Fuel,
@@ -14,7 +15,16 @@ import {
   Zap,
   Plus,
   Clock,
+  ShieldCheck,
+  LogOut,
 } from 'lucide-react'
+
+type Role = 'ADMIN' | 'MANAGER' | 'CASHIER'
+
+type SidebarUser = {
+  name: string
+  role: Role
+}
 
 const navItems = [
   { label: 'Dashboard', href: '/dashboard', icon: LayoutDashboard },
@@ -29,8 +39,22 @@ const navItems = [
   { label: 'Settings', href: '/settings', icon: Settings },
 ]
 
-export default function Sidebar() {
+const roleLabels: Record<Role, string> = {
+  ADMIN: 'Administrator',
+  MANAGER: 'Manager',
+  CASHIER: 'Cashier',
+}
+
+export default function Sidebar({ user }: { user: SidebarUser }) {
   const pathname = usePathname()
+
+  const items =
+    user.role === 'ADMIN' || user.role === 'MANAGER'
+      ? [
+          ...navItems,
+          { label: 'User Approvals', href: '/admin/users', icon: ShieldCheck },
+        ]
+      : navItems
 
   return (
     <aside className="w-60 bg-gray-900 text-white flex flex-col h-full shrink-0">
@@ -48,7 +72,7 @@ export default function Sidebar() {
 
       {/* Navigation */}
       <nav className="flex-1 px-3 py-4 space-y-1">
-        {navItems.map((item) => {
+        {items.map((item) => {
           const Icon = item.icon
 
           const isActive =
@@ -76,12 +100,22 @@ export default function Sidebar() {
       <div className="px-4 py-4 border-t border-gray-700">
         <div className="flex items-center gap-3">
           <div className="w-8 h-8 rounded-full bg-amber-500 flex items-center justify-center text-gray-900 text-xs font-bold">
-            A
+            {user.name.charAt(0).toUpperCase()}
           </div>
-          <div>
-            <p className="text-sm font-medium text-white">Admin</p>
-            <p className="text-xs text-gray-400">Administrator</p>
+          <div className="min-w-0 flex-1">
+            <p className="truncate text-sm font-medium text-white">
+              {user.name}
+            </p>
+            <p className="text-xs text-gray-400">{roleLabels[user.role]}</p>
           </div>
+          <button
+            type="button"
+            onClick={() => signOut({ callbackUrl: '/login' })}
+            className="rounded-lg p-1.5 text-gray-400 hover:bg-gray-800 hover:text-white"
+            title="Sign out"
+          >
+            <LogOut size={16} />
+          </button>
         </div>
       </div>
     </aside>

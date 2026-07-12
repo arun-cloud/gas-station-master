@@ -24,19 +24,6 @@ const prisma = new PrismaClient({ adapter });
 async function main() {
   console.log('Seeding database...')
 
-  // Create admin user
-  const hashedPassword = await bcrypt.hash('admin123', 10)
-  await prisma.user.upsert({
-    where: { email: 'admin@gasstation.com' },
-    update: {},
-    create: {
-      name: 'Station Admin',
-      email: 'admin@gasstation.com',
-      password: hashedPassword,
-      role: Role.ADMIN,
-    },
-  })
-
   const company = await prisma.company.upsert({
     where: {
       vatNumber: "300000000000003",
@@ -109,6 +96,29 @@ async function main() {
   });
 
   console.log(`Branch seeded: ${branch.nameEn}`);
+
+  // Create admin user — active immediately (bootstrap account) and attached
+  // to the seeded branch so it can log in and activate other users.
+  const hashedPassword = await bcrypt.hash('admin123', 10)
+  const admin = await prisma.user.upsert({
+    where: { email: 'admin@gasstation.com' },
+    update: { isActive: true },
+    create: {
+      name: 'Station Admin',
+      email: 'admin@gasstation.com',
+      password: hashedPassword,
+      role: Role.ADMIN,
+      isActive: true,
+    },
+  })
+
+  await prisma.userBranch.upsert({
+    where: { userId_branchId: { userId: admin.id, branchId: branch.id } },
+    update: {},
+    create: { userId: admin.id, branchId: branch.id, isPrimary: true },
+  })
+
+  console.log('Admin seeded: admin@gasstation.com / admin123 (CHANGE THIS PASSWORD)');
 
   const fuelTankData = [
     {
