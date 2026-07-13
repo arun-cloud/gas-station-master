@@ -18,7 +18,7 @@ export async function GET(request: NextRequest) {
     if (error) {
         return NextResponse.redirect(
             new URL(
-                `/settings/integrations?loyverse=failed&error=${encodeURIComponent(error)}`,
+                `/settings?loyverse=failed&error=${encodeURIComponent(error)}`,
                 request.url
             )
         );
@@ -96,7 +96,7 @@ export async function GET(request: NextRequest) {
      */
 
     const response = NextResponse.redirect(
-        new URL("/sales?loyverse=connected", request.url)
+        new URL("/settings?loyverse=connected", request.url)
     );
 
     response.cookies.delete("loyverse_oauth_state");
