@@ -1,117 +1,88 @@
 import TankLevelGauge from './TankLevelGauge'
-import { AlertTriangle } from 'lucide-react'
+import TankForm from '@/components/tanks/TankForm'
+import ActiveToggle from '@/components/shared/ActiveToggle'
+import { setTankActive } from '@/app/actions/tank.actions'
+import type { FuelTank } from '../../../prisma/generated/client'
 
-interface Tank {
-  id:           string
-  tankNumber:   number
-  fuelType:     string
-  capacity:     number | any
-  currentLevel: number | any
-  minLevel:     number | any
+type TankCardProps = {
+  tank: FuelTank
+  canManage: boolean
 }
 
 const fuelLabels: Record<string, { label: string; color: string }> = {
-  PETROL_91:      { label: 'Petrol 91',      color: 'bg-blue-100   text-blue-700'   },
-  PETROL_95:      { label: 'Petrol 95',      color: 'bg-indigo-100 text-indigo-700' },
-  DIESEL:         { label: 'Diesel',         color: 'bg-yellow-100 text-yellow-700' },
+  PETROL_91: { label: 'Petrol 91', color: 'bg-blue-100 text-blue-700' },
+  PETROL_95: { label: 'Petrol 95', color: 'bg-indigo-100 text-indigo-700' },
+  DIESEL: { label: 'Diesel', color: 'bg-yellow-100 text-yellow-700' },
   PREMIUM_DIESEL: { label: 'Premium Diesel', color: 'bg-orange-100 text-orange-700' },
 }
 
-export default function TankCard({ tank }: { tank: Tank }) {
-  const capacity     = Number(tank.capacity)
+export default function TankCard({ tank, canManage }: TankCardProps) {
+  const capacity = Number(tank.capacity)
   const currentLevel = Number(tank.currentLevel)
-  const minLevel     = Number(tank.minLevel)
-  const percentage   = Math.round((currentLevel / capacity) * 100)
-  const isLow        = currentLevel <= minLevel * 1.5   // within 150% of min
-  const isCritical   = currentLevel <= minLevel         // at or below min
-  const available    = capacity - currentLevel          // space remaining
+  const minLevel = Number(tank.minLevel)
+  const percentage = capacity > 0 ? (currentLevel / capacity) * 100 : 0
+  const isCritical = currentLevel <= minLevel
+  const isLow = !isCritical && currentLevel <= minLevel * 1.5
 
   const fuel = fuelLabels[tank.fuelType] ?? {
     label: tank.fuelType,
-    color: 'bg-gray-100 text-gray-600'
+    color: 'bg-gray-100 text-gray-600',
   }
 
   return (
-    <div className={`bg-white rounded-xl border p-5
-      ${isCritical
-        ? 'border-red-300 ring-1 ring-red-200'
-        : isLow
-        ? 'border-amber-300'
-        : 'border-gray-200'}`}>
+    <article
+      className={`flex items-center gap-4 rounded-xl border border-gray-200 bg-white p-5 ${
+        tank.isActive ? '' : 'opacity-60'
+      }`}
+    >
+      <TankLevelGauge percentage={percentage} isLow={isLow} isCritical={isCritical} />
 
-      {/* Header */}
-      <div className="flex items-start justify-between mb-4">
-        <div>
-          <p className="text-lg font-bold text-gray-800">
-            Tank #{tank.tankNumber}
-          </p>
-          <span className={`text-xs font-medium px-2 py-0.5
-            rounded-full ${fuel.color}`}>
-            {fuel.label}
+      <div className="min-w-0 flex-1">
+        <div className="flex items-start justify-between gap-2">
+          <div>
+            <p className="text-xs font-medium uppercase tracking-wide text-gray-400">Tank</p>
+            <h2 className="text-lg font-bold text-gray-800">#{tank.tankNumber}</h2>
+          </div>
+
+          {canManage ? (
+            <div className="flex items-center gap-1">
+              <TankForm
+                mode="edit"
+                branchId={tank.branchId}
+                tank={{
+                  id: tank.id,
+                  tankNumber: String(tank.tankNumber),
+                  fuelType: tank.fuelType,
+                  capacity: String(capacity),
+                  currentLevel: String(currentLevel),
+                  minLevel: String(minLevel),
+                }}
+              />
+              <ActiveToggle
+                id={tank.id}
+                isActive={tank.isActive}
+                action={setTankActive}
+                confirmDisableMessage="Decommission this tank? It will be hidden from active use but delivery history is preserved."
+              />
+            </div>
+          ) : null}
+        </div>
+
+        <span className={`mt-1 inline-block rounded-full px-2 py-0.5 text-xs font-medium ${fuel.color}`}>
+          {fuel.label}
+        </span>
+
+        <p className="mt-2 text-sm text-gray-600">
+          {currentLevel.toLocaleString()} / {capacity.toLocaleString()} L
+        </p>
+        <p className="text-xs text-gray-400">Alert threshold: {minLevel.toLocaleString()} L</p>
+
+        {!tank.isActive ? (
+          <span className="mt-2 inline-block rounded-full bg-gray-200 px-2 py-0.5 text-xs font-medium text-gray-500">
+            Decommissioned
           </span>
-        </div>
-
-        {/* Alert badge */}
-        {isCritical && (
-          <div className="flex items-center gap-1.5 bg-red-100 text-red-700
-            px-2.5 py-1 rounded-full text-xs font-medium">
-            <AlertTriangle size={12} />
-            Critical
-          </div>
-        )}
-        {isLow && !isCritical && (
-          <div className="flex items-center gap-1.5 bg-amber-100 text-amber-700
-            px-2.5 py-1 rounded-full text-xs font-medium">
-            <AlertTriangle size={12} />
-            Low
-          </div>
-        )}
+        ) : null}
       </div>
-
-      {/* Gauge + stats side by side */}
-      <div className="flex items-center gap-4">
-        <TankLevelGauge
-          percentage={percentage}
-          isLow={isLow}
-          isCritical={isCritical}
-        />
-
-        {/* Stats */}
-        <div className="flex-1 space-y-2.5">
-          <div className="flex justify-between text-sm">
-            <span className="text-gray-400">Current</span>
-            <span className="font-medium text-gray-700">
-              {currentLevel.toLocaleString()} L
-            </span>
-          </div>
-          <div className="flex justify-between text-sm">
-            <span className="text-gray-400">Capacity</span>
-            <span className="font-medium text-gray-700">
-              {capacity.toLocaleString()} L
-            </span>
-          </div>
-          <div className="flex justify-between text-sm">
-            <span className="text-gray-400">Available</span>
-            <span className="font-medium text-gray-700">
-              {available.toLocaleString()} L
-            </span>
-          </div>
-          <div className="flex justify-between text-sm">
-            <span className="text-gray-400">Min. level</span>
-            <span className={`font-medium ${isCritical ? 'text-red-600' : 'text-gray-700'}`}>
-              {minLevel.toLocaleString()} L
-            </span>
-          </div>
-        </div>
-      </div>
-
-      {/* Alert bar at bottom when critical */}
-      {isCritical && (
-        <div className="mt-4 bg-red-50 border border-red-200 rounded-lg
-          px-3 py-2 text-xs text-red-700">
-          Tank is at or below minimum level. Order a delivery immediately.
-        </div>
-      )}
-    </div>
+    </article>
   )
 }

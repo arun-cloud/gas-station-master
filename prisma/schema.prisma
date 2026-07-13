@@ -120,6 +120,11 @@ model Dispenser {
   dispenserNumber Int
   branchId        String
   status          DispenserStatus @default(IDLE)
+  isActive        Boolean         @default(true)
+
+  // Audit: who created/last modified this dispenser
+  createdBy String?
+  updatedBy String?
 
   branch  Branch   @relation(fields: [branchId], references: [id])
   nozzles Nozzle[]
@@ -129,6 +134,7 @@ model Dispenser {
   sales     Sale[]
 
   @@unique([branchId, dispenserNumber])
+  @@index([isActive])
 }
 
 enum DispenserStatus {
@@ -145,6 +151,11 @@ model Nozzle {
   fuelType       FuelType
   currentReading Decimal  @default(0) @db.Decimal(18, 3)
   dispenserID    String
+  isActive       Boolean  @default(true)
+
+  // Audit: who created/last modified this nozzle
+  createdBy String?
+  updatedBy String?
 
   dispenser Dispenser @relation(fields: [dispenserID], references: [id], onDelete: Cascade)
 
@@ -154,6 +165,7 @@ model Nozzle {
   sales Sale[]
 
   @@unique([dispenserID, nozzleNumber])
+  @@index([isActive])
 }
 
 // ─── Fuel Inventory ────────────────────────────────────
@@ -165,6 +177,12 @@ model FuelTank {
   capacity     Decimal
   currentLevel Decimal
   minLevel     Decimal // alert threshold
+  isActive     Boolean  @default(true)
+
+  // Audit: who created/last modified this tank
+  createdBy String?
+  updatedBy String?
+
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 
@@ -172,6 +190,7 @@ model FuelTank {
   branch     Branch         @relation(fields: [branchId], references: [id])
 
   @@unique([branchId, tankNumber])
+  @@index([isActive])
 }
 
 enum FuelType {

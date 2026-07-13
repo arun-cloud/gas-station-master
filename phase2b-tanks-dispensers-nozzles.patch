@@ -1,0 +1,3262 @@
+From 278984eba1614818c4e61485450ec067cbfcb10b Mon Sep 17 00:00:00 2001
+From: Fuel Management System <dev@fuelstation.local>
+Date: Mon, 13 Jul 2026 21:36:12 +0000
+Subject: [PATCH] feat: Phase 2B - branch-scoped, RBAC-protected Tank,
+ Dispenser, and Nozzle management
+
+---
+ .../migration.sql                             |  23 +
+ prisma/schema.prisma                          |  19 +
+ src/app/(dashboard)/dispensers/page.tsx       | 147 ++----
+ src/app/(dashboard)/fuel/page.tsx             | 160 +++---
+ src/app/actions/dispenser.actions.ts          | 191 +++++++
+ src/app/actions/nozzle.actions.ts             | 145 ++++++
+ src/app/actions/pump.actions.ts               | 270 ----------
+ src/app/actions/tank.actions.ts               | 151 ++++++
+ src/components/dispensers/AddNozzleForm.tsx   |  99 ++++
+ src/components/dispensers/AddPumpForm.tsx     | 484 ------------------
+ src/components/dispensers/DispenserCard.tsx   | 148 ++++++
+ src/components/dispensers/DispenserForm.tsx   | 210 ++++++++
+ .../dispensers/DispenserStatusButton.tsx      |  74 +++
+ src/components/dispensers/PumpCard.tsx        | 152 ------
+ .../dispensers/PumpReadingInput.tsx           |  77 ---
+ .../dispensers/PumpStatusButton.tsx           |  80 ---
+ src/components/fuel/TankCard.tsx              | 161 +++---
+ src/components/shared/ActiveToggle.tsx        |  57 +++
+ src/components/tanks/TankForm.tsx             | 214 ++++++++
+ src/lib/validation/equipment.schema.ts        |  72 +++
+ 20 files changed, 1571 insertions(+), 1363 deletions(-)
+ create mode 100644 prisma/migrations/20260714090000_add_equipment_audit_and_status/migration.sql
+ create mode 100644 src/app/actions/dispenser.actions.ts
+ create mode 100644 src/app/actions/nozzle.actions.ts
+ delete mode 100644 src/app/actions/pump.actions.ts
+ create mode 100644 src/app/actions/tank.actions.ts
+ delete mode 100644 src/components/dispensers/AddPumpForm.tsx
+ create mode 100644 src/components/dispensers/DispenserCard.tsx
+ create mode 100644 src/components/dispensers/DispenserForm.tsx
+ create mode 100644 src/components/dispensers/DispenserStatusButton.tsx
+ delete mode 100644 src/components/dispensers/PumpCard.tsx
+ delete mode 100644 src/components/dispensers/PumpReadingInput.tsx
+ delete mode 100644 src/components/dispensers/PumpStatusButton.tsx
+ create mode 100644 src/components/shared/ActiveToggle.tsx
+ create mode 100644 src/components/tanks/TankForm.tsx
+ create mode 100644 src/lib/validation/equipment.schema.ts
+
+diff --git a/prisma/migrations/20260714090000_add_equipment_audit_and_status/migration.sql b/prisma/migrations/20260714090000_add_equipment_audit_and_status/migration.sql
+new file mode 100644
+index 0000000..c250821
+--- /dev/null
++++ b/prisma/migrations/20260714090000_add_equipment_audit_and_status/migration.sql
+@@ -0,0 +1,23 @@
++-- AlterTable: add audit fields + soft-disable flag to Dispenser
++ALTER TABLE "Dispenser" ADD COLUMN IF NOT EXISTS "isActive" BOOLEAN NOT NULL DEFAULT true;
++ALTER TABLE "Dispenser" ADD COLUMN IF NOT EXISTS "createdBy" TEXT;
++ALTER TABLE "Dispenser" ADD COLUMN IF NOT EXISTS "updatedBy" TEXT;
++
++-- CreateIndex
++CREATE INDEX IF NOT EXISTS "Dispenser_isActive_idx" ON "Dispenser"("isActive");
++
++-- AlterTable: add audit fields + soft-disable flag to Nozzle
++ALTER TABLE "Nozzle" ADD COLUMN IF NOT EXISTS "isActive" BOOLEAN NOT NULL DEFAULT true;
++ALTER TABLE "Nozzle" ADD COLUMN IF NOT EXISTS "createdBy" TEXT;
++ALTER TABLE "Nozzle" ADD COLUMN IF NOT EXISTS "updatedBy" TEXT;
++
++-- CreateIndex
++CREATE INDEX IF NOT EXISTS "Nozzle_isActive_idx" ON "Nozzle"("isActive");
++
++-- AlterTable: add audit fields + soft-disable flag to FuelTank
++ALTER TABLE "FuelTank" ADD COLUMN IF NOT EXISTS "isActive" BOOLEAN NOT NULL DEFAULT true;
++ALTER TABLE "FuelTank" ADD COLUMN IF NOT EXISTS "createdBy" TEXT;
++ALTER TABLE "FuelTank" ADD COLUMN IF NOT EXISTS "updatedBy" TEXT;
++
++-- CreateIndex
++CREATE INDEX IF NOT EXISTS "FuelTank_isActive_idx" ON "FuelTank"("isActive");
+diff --git a/prisma/schema.prisma b/prisma/schema.prisma
+index b203b28..9cf2905 100644
+--- a/prisma/schema.prisma
++++ b/prisma/schema.prisma
+@@ -120,6 +120,11 @@ model Dispenser {
+   dispenserNumber Int
+   branchId        String
+   status          DispenserStatus @default(IDLE)
++  isActive        Boolean         @default(true)
++
++  // Audit: who created/last modified this dispenser
++  createdBy String?
++  updatedBy String?
+ 
+   branch  Branch   @relation(fields: [branchId], references: [id])
+   nozzles Nozzle[]
+@@ -129,6 +134,7 @@ model Dispenser {
+   sales     Sale[]
+ 
+   @@unique([branchId, dispenserNumber])
++  @@index([isActive])
+ }
+ 
+ enum DispenserStatus {
+@@ -145,6 +151,11 @@ model Nozzle {
+   fuelType       FuelType
+   currentReading Decimal  @default(0) @db.Decimal(18, 3)
+   dispenserID    String
++  isActive       Boolean  @default(true)
++
++  // Audit: who created/last modified this nozzle
++  createdBy String?
++  updatedBy String?
+ 
+   dispenser Dispenser @relation(fields: [dispenserID], references: [id], onDelete: Cascade)
+ 
+@@ -154,6 +165,7 @@ model Nozzle {
+   sales Sale[]
+ 
+   @@unique([dispenserID, nozzleNumber])
++  @@index([isActive])
+ }
+ 
+ // ─── Fuel Inventory ────────────────────────────────────
+@@ -165,6 +177,12 @@ model FuelTank {
+   capacity     Decimal
+   currentLevel Decimal
+   minLevel     Decimal // alert threshold
++  isActive     Boolean  @default(true)
++
++  // Audit: who created/last modified this tank
++  createdBy String?
++  updatedBy String?
++
+   createdAt    DateTime @default(now())
+   updatedAt    DateTime @updatedAt
+ 
+@@ -172,6 +190,7 @@ model FuelTank {
+   branch     Branch         @relation(fields: [branchId], references: [id])
+ 
+   @@unique([branchId, tankNumber])
++  @@index([isActive])
+ }
+ 
+ enum FuelType {
+diff --git a/src/app/(dashboard)/dispensers/page.tsx b/src/app/(dashboard)/dispensers/page.tsx
+index 1af3a19..bfd1094 100644
+--- a/src/app/(dashboard)/dispensers/page.tsx
++++ b/src/app/(dashboard)/dispensers/page.tsx
+@@ -1,117 +1,65 @@
++import { requireUser } from '@/lib/rbac'
++import { resolveActiveBranch } from '@/lib/branch-context'
+ import { prisma } from '@/lib/prisma'
+-import PumpCard from '@/components/dispensers/PumpCard'
+-import AddPumpForm from '@/components/dispensers/AddPumpForm'
+-import { Gauge } from 'lucide-react'
++import DispenserForm from '@/components/dispensers/DispenserForm'
++import DispenserCard from '@/components/dispensers/DispenserCard'
++import { Gauge, Building2 } from 'lucide-react'
+ 
+-export default async function PumpsPage() {
+-  // Temporary single-branch implementation.
+-  // Later this should come from the authenticated user's branchId.
+-  const branch = await prisma.branch.findFirst({
+-    orderBy: {
+-      createdAt: 'asc',
+-    },
+-    select: {
+-      id: true,
+-      nameEn: true,
+-    },
+-  })
++export default async function DispensersPage() {
++  const user = await requireUser()
++  const { activeBranch } = await resolveActiveBranch()
+ 
+-  if (!branch) {
++  // Permission state: user is authenticated but has no accessible branch yet.
++  if (!activeBranch) {
+     return (
+       <div className="rounded-xl border border-amber-200 bg-amber-50 p-5">
+-        <h1 className="text-lg font-semibold text-amber-900">
+-          Branch required
+-        </h1>
+-
++        <Building2 size={24} className="mb-2 text-amber-600" />
++        <h1 className="text-lg font-semibold text-amber-900">No branch access</h1>
+         <p className="mt-1 text-sm text-amber-700">
+-          Create a Fuel Arkan branch before adding
+-          dispensers.
++          You don&apos;t have access to any active branch yet. Contact an administrator to be
++          assigned to a branch.
+         </p>
+       </div>
+     )
+   }
+ 
+-  const dispensers =
+-    await prisma.dispenser.findMany({
+-      where: {
+-        branchId: branch.id,
+-      },
+-
+-      include: {
+-        nozzles: {
+-          orderBy: {
+-            nozzleNumber: 'asc',
+-          },
+-        },
+-      },
++  const canManage = user.role === 'ADMIN' || user.role === 'MANAGER'
+ 
+-      orderBy: {
+-        dispenserNumber: 'asc',
++  const dispensers = await prisma.dispenser.findMany({
++    where: { branchId: activeBranch.id },
++    include: {
++      nozzles: {
++        orderBy: { nozzleNumber: 'asc' },
+       },
+-    })
++    },
++    orderBy: { dispenserNumber: 'asc' },
++  })
+ 
+   const counts = {
+-    ACTIVE: dispensers.filter(
+-      dispenser =>
+-        dispenser.status === 'ACTIVE',
+-    ).length,
+-
+-    IDLE: dispensers.filter(
+-      dispenser => dispenser.status === 'IDLE',
+-    ).length,
+-
+-    MAINTENANCE: dispensers.filter(
+-      dispenser =>
+-        dispenser.status === 'MAINTENANCE',
+-    ).length,
+-
+-    OFFLINE: dispensers.filter(
+-      dispenser =>
+-        dispenser.status === 'OFFLINE',
+-    ).length,
++    ACTIVE: dispensers.filter(d => d.isActive && d.status === 'ACTIVE').length,
++    IDLE: dispensers.filter(d => d.isActive && d.status === 'IDLE').length,
++    MAINTENANCE: dispensers.filter(d => d.isActive && d.status === 'MAINTENANCE').length,
++    OFFLINE: dispensers.filter(d => !d.isActive || d.status === 'OFFLINE').length,
+   }
+ 
+   const summaries = [
+-    {
+-      label: 'Active',
+-      count: counts.ACTIVE,
+-      color:
+-        'bg-green-100 text-green-700',
+-    },
+-    {
+-      label: 'Idle',
+-      count: counts.IDLE,
+-      color: 'bg-gray-100 text-gray-600',
+-    },
+-    {
+-      label: 'Maintenance',
+-      count: counts.MAINTENANCE,
+-      color:
+-        'bg-amber-100 text-amber-700',
+-    },
+-    {
+-      label: 'Offline',
+-      count: counts.OFFLINE,
+-      color: 'bg-red-100 text-red-600',
+-    },
++    { label: 'Active', count: counts.ACTIVE, color: 'bg-green-100 text-green-700' },
++    { label: 'Idle', count: counts.IDLE, color: 'bg-gray-100 text-gray-600' },
++    { label: 'Maintenance', count: counts.MAINTENANCE, color: 'bg-amber-100 text-amber-700' },
++    { label: 'Offline', count: counts.OFFLINE, color: 'bg-red-100 text-red-600' },
+   ]
+ 
+   return (
+     <div className="space-y-6">
+       <div className="flex items-center justify-between gap-4">
+         <div>
+-          <h1 className="text-2xl font-bold text-gray-800">
+-            Dispensers Management
+-          </h1>
+-
++          <h1 className="text-2xl font-bold text-gray-800">Dispensers Management</h1>
+           <p className="mt-0.5 text-sm text-gray-500">
+-            {dispensers.length} dispensers total
+-            {' · '}
+-            {branch.nameEn}
++            {dispensers.length} dispensers total · {activeBranch.nameEn}
+           </p>
+         </div>
+ 
+-        <AddPumpForm branchId={branch.id} />
++        {canManage ? <DispenserForm branchId={activeBranch.id} /> : null}
+       </div>
+ 
+       <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+@@ -120,13 +68,8 @@ export default async function PumpsPage() {
+             key={item.label}
+             className="flex items-center justify-between rounded-xl border border-gray-200 bg-white px-4 py-3"
+           >
+-            <span className="text-sm text-gray-500">
+-              {item.label}
+-            </span>
+-
+-            <span
+-              className={`rounded-full px-2.5 py-0.5 text-sm font-semibold ${item.color}`}
+-            >
++            <span className="text-sm text-gray-500">{item.label}</span>
++            <span className={`rounded-full px-2.5 py-0.5 text-sm font-semibold ${item.color}`}>
+               {item.count}
+             </span>
+           </div>
+@@ -135,26 +78,20 @@ export default async function PumpsPage() {
+ 
+       {dispensers.length === 0 ? (
+         <div className="py-16 text-center text-gray-400">
+-          <Gauge
+-            size={40}
+-            className="mx-auto mb-3 opacity-30"
+-          />
+-
++          <Gauge size={40} className="mx-auto mb-3 opacity-30" />
+           <p className="text-sm">
+-            No dispensers yet. Add your first
+-            dispenser above.
++            {canManage
++              ? 'No dispensers yet. Add your first dispenser above.'
++              : 'No dispensers configured for this branch yet.'}
+           </p>
+         </div>
+       ) : (
+         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
+           {dispensers.map(dispenser => (
+-            <PumpCard
+-              key={dispenser.id}
+-              pump={dispenser}
+-            />
++            <DispenserCard key={dispenser.id} dispenser={dispenser} canManage={canManage} />
+           ))}
+         </div>
+       )}
+     </div>
+   )
+-}
+\ No newline at end of file
++}
+diff --git a/src/app/(dashboard)/fuel/page.tsx b/src/app/(dashboard)/fuel/page.tsx
+index 89aaf14..3e8cb99 100644
+--- a/src/app/(dashboard)/fuel/page.tsx
++++ b/src/app/(dashboard)/fuel/page.tsx
+@@ -1,142 +1,102 @@
+-import { prisma }          from '@/lib/prisma'
+-import TankCard            from '@/components/fuel/TankCard'
+-import AddDeliveryForm     from '@/components/fuel/AddDeliveryForm'
+-import DeliveryHistory     from '@/components/fuel/DeliveryHistory'
+-import { Fuel, AlertTriangle } from 'lucide-react'
++import { requireUser } from '@/lib/rbac'
++import { resolveActiveBranch } from '@/lib/branch-context'
++import { prisma } from '@/lib/prisma'
++import TankForm from '@/components/tanks/TankForm'
++import TankCard from '@/components/fuel/TankCard'
++import { Fuel, AlertTriangle, Building2 } from 'lucide-react'
+ 
+ export default async function FuelInventoryPage() {
+-  const [tanks, suppliers, recentDeliveries] = await Promise.all([
+-    prisma.fuelTank.findMany({
+-      orderBy: { tankNumber: 'asc' }
+-    }),
+-    prisma.supplier.findMany({
+-      where:   { isActive: true },
+-      orderBy: { name: 'asc' }
+-    }),
+-    prisma.fuelDelivery.findMany({
+-      orderBy: { deliveredAt: 'desc' },
+-      take:    20,
+-      include: {
+-        tank:     { select: { tankNumber: true, fuelType: true } },
+-        supplier: { select: { name: true } },
+-      },
+-    }),
+-  ])
++  const user = await requireUser()
++  const { activeBranch } = await resolveActiveBranch()
+ 
+-  const criticalTanks = tanks.filter(
+-    t => Number(t.currentLevel) <= Number(t.minLevel)
+-  )
+-  const lowTanks = tanks.filter(
+-    t => Number(t.currentLevel) <= Number(t.minLevel) * 1.5
+-      && Number(t.currentLevel) > Number(t.minLevel)
++  if (!activeBranch) {
++    return (
++      <div className="rounded-xl border border-amber-200 bg-amber-50 p-5">
++        <Building2 size={24} className="mb-2 text-amber-600" />
++        <h1 className="text-lg font-semibold text-amber-900">No branch access</h1>
++        <p className="mt-1 text-sm text-amber-700">
++          You don&apos;t have access to any active branch yet. Contact an administrator to be
++          assigned to a branch.
++        </p>
++      </div>
++    )
++  }
++
++  const canManage = user.role === 'ADMIN' || user.role === 'MANAGER'
++
++  const tanks = await prisma.fuelTank.findMany({
++    where: { branchId: activeBranch.id },
++    orderBy: { tankNumber: 'asc' },
++  })
++
++  const activeTanks = tanks.filter(tank => tank.isActive)
++
++  const criticalTanks = activeTanks.filter(tank => Number(tank.currentLevel) <= Number(tank.minLevel))
++  const lowTanks = activeTanks.filter(
++    tank =>
++      Number(tank.currentLevel) <= Number(tank.minLevel) * 1.5 &&
++      Number(tank.currentLevel) > Number(tank.minLevel),
+   )
+ 
+   return (
+     <div className="space-y-6">
+-
+-      {/* Page header */}
+-      <div className="flex items-center justify-between">
++      <div className="flex items-center justify-between gap-4">
+         <div>
+-          <h1 className="text-2xl font-bold text-gray-800">Fuel Inventory</h1>
+-          <p className="text-sm text-gray-500 mt-0.5">
+-            {tanks.length} tanks monitored
++          <h1 className="text-2xl font-bold text-gray-800">Fuel Tanks</h1>
++          <p className="mt-0.5 text-sm text-gray-500">
++            {tanks.length} tanks configured · {activeBranch.nameEn}
+           </p>
+         </div>
+-        <AddDeliveryForm tanks={tanks as any} suppliers={suppliers} />
++
++        {canManage ? <TankForm mode="create" branchId={activeBranch.id} /> : null}
+       </div>
+ 
+-      {/* Critical alerts banner */}
++      {/* Critical alerts */}
+       {criticalTanks.length > 0 && (
+-        <div className="bg-red-50 border border-red-200 rounded-xl px-5 py-4
+-          flex items-start gap-3">
+-          <AlertTriangle size={20} className="text-red-500 shrink-0 mt-0.5" />
++        <div className="flex items-start gap-3 rounded-xl border border-red-200 bg-red-50 px-5 py-4">
++          <AlertTriangle size={20} className="mt-0.5 shrink-0 text-red-500" />
+           <div>
+             <p className="text-sm font-semibold text-red-800">
+               {criticalTanks.length} tank{criticalTanks.length > 1 ? 's' : ''} at critical level
+             </p>
+-            <p className="text-sm text-red-600 mt-0.5">
+-              {criticalTanks.map(t => `Tank #${t.tankNumber}`).join(', ')} —
+-              immediate delivery required.
++            <p className="mt-0.5 text-sm text-red-600">
++              {criticalTanks.map(tank => `Tank #${tank.tankNumber}`).join(', ')} — a delivery
++              record will be needed once Phase 7 (Deliveries) is available.
+             </p>
+           </div>
+         </div>
+       )}
+ 
+-      {/* Low level warning */}
+       {lowTanks.length > 0 && criticalTanks.length === 0 && (
+-        <div className="bg-amber-50 border border-amber-200 rounded-xl px-5 py-4
+-          flex items-start gap-3">
+-          <AlertTriangle size={20} className="text-amber-500 shrink-0 mt-0.5" />
++        <div className="flex items-start gap-3 rounded-xl border border-amber-200 bg-amber-50 px-5 py-4">
++          <AlertTriangle size={20} className="mt-0.5 shrink-0 text-amber-500" />
+           <div>
+             <p className="text-sm font-semibold text-amber-800">
+               {lowTanks.length} tank{lowTanks.length > 1 ? 's' : ''} running low
+             </p>
+-            <p className="text-sm text-amber-600 mt-0.5">
+-              {lowTanks.map(t => `Tank #${t.tankNumber}`).join(', ')} —
+-              schedule a delivery soon.
++            <p className="mt-0.5 text-sm text-amber-600">
++              {lowTanks.map(tank => `Tank #${tank.tankNumber}`).join(', ')} — keep an eye on these.
+             </p>
+           </div>
+         </div>
+       )}
+ 
+-      {/* Summary strip */}
+-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+-        {tanks.map(tank => {
+-          const pct = Math.round(
+-            (Number(tank.currentLevel) / Number(tank.capacity)) * 100
+-          )
+-          const isCritical = Number(tank.currentLevel) <= Number(tank.minLevel)
+-          const isLow = Number(tank.currentLevel) <= Number(tank.minLevel) * 1.5
+-
+-          return (
+-            <div key={tank.id}
+-              className="bg-white rounded-xl border border-gray-200 px-4 py-3">
+-              <p className="text-xs text-gray-400">Tank #{tank.tankNumber}</p>
+-              <div className="mt-1.5 h-1.5 bg-gray-100 rounded-full overflow-hidden">
+-                <div
+-                  className={`h-full rounded-full ${
+-                    isCritical ? 'bg-red-500' : isLow ? 'bg-amber-500' : 'bg-green-500'
+-                  }`}
+-                  style={{ width: `${pct}%` }}
+-                />
+-              </div>
+-              <p className={`text-sm font-semibold mt-1 ${
+-                isCritical ? 'text-red-600' : isLow ? 'text-amber-600' : 'text-gray-800'
+-              }`}>
+-                {pct}%
+-              </p>
+-            </div>
+-          )
+-        })}
+-      </div>
+-
+-      {/* Tank cards grid */}
+       {tanks.length === 0 ? (
+-        <div className="text-center py-16 text-gray-400">
++        <div className="py-16 text-center text-gray-400">
+           <Fuel size={40} className="mx-auto mb-3 opacity-30" />
+-          <p className="text-sm">No tanks configured yet.</p>
++          <p className="text-sm">
++            {canManage
++              ? 'No tanks configured yet. Add your first tank above.'
++              : 'No tanks configured for this branch yet.'}
++          </p>
+         </div>
+       ) : (
+-        <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-2 gap-4">
++        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+           {tanks.map(tank => (
+-            <TankCard key={tank.id} tank={tank as any} />
++            <TankCard key={tank.id} tank={tank} canManage={canManage} />
+           ))}
+         </div>
+       )}
+-
+-      {/* Delivery history */}
+-      <div className="bg-white rounded-xl border border-gray-200 p-5">
+-        <div className="flex items-center justify-between mb-4">
+-          <h2 className="text-base font-semibold text-gray-800">
+-            Recent Deliveries
+-          </h2>
+-          <span className="text-xs text-gray-400">
+-            Last {recentDeliveries.length} records
+-          </span>
+-        </div>
+-        <DeliveryHistory deliveries={recentDeliveries as any} />
+-      </div>
+-
+     </div>
+   )
+-}
+\ No newline at end of file
++}
+diff --git a/src/app/actions/dispenser.actions.ts b/src/app/actions/dispenser.actions.ts
+new file mode 100644
+index 0000000..3a2cb0e
+--- /dev/null
++++ b/src/app/actions/dispenser.actions.ts
+@@ -0,0 +1,191 @@
++'use server'
++
++import { revalidatePath } from 'next/cache'
++import { prisma } from '@/lib/prisma'
++import { requireRole, requireBranchAccess, ForbiddenError } from '@/lib/rbac'
++import { Prisma, type DispenserStatus } from '../../../prisma/generated/client'
++import { dispenserInputSchema, firstZodMessage } from '@/lib/validation/equipment.schema'
++
++export type DispenserActionResult = {
++  success: boolean
++  error?: string
++}
++
++function readDispenserFormData(formData: FormData) {
++  const nozzleCount = Number(formData.get('nozzleCount') ?? 0)
++  const safeCount = Number.isFinite(nozzleCount) && nozzleCount > 0 ? nozzleCount : 0
++
++  const nozzles = Array.from({ length: safeCount }, (_, index) => ({
++    nozzleNumber: formData.get(`nozzleNumber_${index}`),
++    fuelType: formData.get(`fuelType_${index}`),
++  }))
++
++  return {
++    branchId: formData.get('branchId'),
++    dispenserNumber: formData.get('dispenserNumber'),
++    nozzles,
++  }
++}
++
++// ── Create a dispenser with its nozzles, atomically (ADMIN/MANAGER) ──
++export async function createDispenser(formData: FormData): Promise<DispenserActionResult> {
++  try {
++    const actor = await requireRole(['ADMIN', 'MANAGER'])
++
++    const parsed = dispenserInputSchema.safeParse(readDispenserFormData(formData))
++    if (!parsed.success) {
++      return { success: false, error: firstZodMessage(parsed.error) }
++    }
++    const data = parsed.data
++
++    await requireBranchAccess(data.branchId)
++
++    await prisma.dispenser.create({
++      data: {
++        branchId: data.branchId,
++        dispenserNumber: data.dispenserNumber,
++        status: 'IDLE',
++        createdBy: actor.id,
++        nozzles: {
++          create: data.nozzles.map(nozzle => ({
++            nozzleNumber: nozzle.nozzleNumber,
++            fuelType: nozzle.fuelType,
++            createdBy: actor.id,
++          })),
++        },
++      },
++    })
++
++    revalidatePath('/dispensers')
++    revalidatePath('/dashboard')
++    return { success: true }
++  } catch (error: unknown) {
++    if (error instanceof ForbiddenError) {
++      return { success: false, error: error.message }
++    }
++    if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
++      return { success: false, error: 'A dispenser or nozzle with this number already exists' }
++    }
++    console.error('Failed to create dispenser:', error)
++    return { success: false, error: 'Failed to create dispenser' }
++  }
++}
++
++// ── Update a dispenser's branch/number (ADMIN/MANAGER) ────────
++export async function updateDispenser(
++  dispenserId: string,
++  formData: FormData,
++): Promise<DispenserActionResult> {
++  try {
++    const actor = await requireRole(['ADMIN', 'MANAGER'])
++    if (!dispenserId) return { success: false, error: 'Dispenser ID is required' }
++
++    const existing = await prisma.dispenser.findUnique({
++      where: { id: dispenserId },
++      select: { branchId: true },
++    })
++    if (!existing) return { success: false, error: 'Dispenser not found' }
++
++    const branchId = String(formData.get('branchId') ?? '').trim()
++    const dispenserNumber = Number(formData.get('dispenserNumber'))
++
++    if (!branchId) return { success: false, error: 'Branch is required' }
++    if (!Number.isInteger(dispenserNumber) || dispenserNumber <= 0) {
++      return { success: false, error: 'Enter a valid dispenser number' }
++    }
++
++    await requireBranchAccess(existing.branchId)
++    if (branchId !== existing.branchId) {
++      await requireBranchAccess(branchId)
++    }
++
++    await prisma.dispenser.update({
++      where: { id: dispenserId },
++      data: { branchId, dispenserNumber, updatedBy: actor.id },
++    })
++
++    revalidatePath('/dispensers')
++    revalidatePath('/dashboard')
++    return { success: true }
++  } catch (error: unknown) {
++    if (error instanceof ForbiddenError) {
++      return { success: false, error: error.message }
++    }
++    if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
++      return { success: false, error: 'A dispenser with this number already exists at this branch' }
++    }
++    if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2025') {
++      return { success: false, error: 'Dispenser not found' }
++    }
++    console.error('Failed to update dispenser:', error)
++    return { success: false, error: 'Failed to update dispenser' }
++  }
++}
++
++// ── Operational status: IDLE / ACTIVE / MAINTENANCE / OFFLINE (ADMIN/MANAGER) ──
++export async function updateDispenserStatus(
++  dispenserId: string,
++  status: DispenserStatus,
++): Promise<DispenserActionResult> {
++  try {
++    const actor = await requireRole(['ADMIN', 'MANAGER'])
++    if (!dispenserId) return { success: false, error: 'Dispenser ID is required' }
++
++    const existing = await prisma.dispenser.findUnique({
++      where: { id: dispenserId },
++      select: { branchId: true },
++    })
++    if (!existing) return { success: false, error: 'Dispenser not found' }
++
++    await requireBranchAccess(existing.branchId)
++
++    await prisma.dispenser.update({
++      where: { id: dispenserId },
++      data: { status, updatedBy: actor.id },
++    })
++
++    revalidatePath('/dispensers')
++    revalidatePath('/dashboard')
++    return { success: true }
++  } catch (error: unknown) {
++    if (error instanceof ForbiddenError) {
++      return { success: false, error: error.message }
++    }
++    console.error('Failed to update dispenser status:', error)
++    return { success: false, error: 'Failed to update dispenser status' }
++  }
++}
++
++// ── Decommission / restore a dispenser (ADMIN/MANAGER) ────────
++// Soft-disabled, never deleted: historical sales must keep a valid FK.
++export async function setDispenserActive(
++  dispenserId: string,
++  isActive: boolean,
++): Promise<DispenserActionResult> {
++  try {
++    const actor = await requireRole(['ADMIN', 'MANAGER'])
++
++    const existing = await prisma.dispenser.findUnique({
++      where: { id: dispenserId },
++      select: { branchId: true },
++    })
++    if (!existing) return { success: false, error: 'Dispenser not found' }
++
++    await requireBranchAccess(existing.branchId)
++
++    await prisma.dispenser.update({
++      where: { id: dispenserId },
++      data: { isActive, updatedBy: actor.id },
++    })
++
++    revalidatePath('/dispensers')
++    revalidatePath('/dashboard')
++    return { success: true }
++  } catch (error: unknown) {
++    if (error instanceof ForbiddenError) {
++      return { success: false, error: error.message }
++    }
++    console.error('Failed to update dispenser status:', error)
++    return { success: false, error: 'Failed to update dispenser status' }
++  }
++}
+diff --git a/src/app/actions/nozzle.actions.ts b/src/app/actions/nozzle.actions.ts
+new file mode 100644
+index 0000000..92f4e85
+--- /dev/null
++++ b/src/app/actions/nozzle.actions.ts
+@@ -0,0 +1,145 @@
++'use server'
++
++import { revalidatePath } from 'next/cache'
++import { prisma } from '@/lib/prisma'
++import { requireRole, requireBranchAccess, ForbiddenError } from '@/lib/rbac'
++import { Prisma } from '../../../prisma/generated/client'
++import { nozzleInputSchema, firstZodMessage } from '@/lib/validation/equipment.schema'
++
++export type NozzleActionResult = {
++  success: boolean
++  error?: string
++}
++
++function readNozzleFormData(formData: FormData) {
++  return {
++    nozzleNumber: formData.get('nozzleNumber'),
++    fuelType: formData.get('fuelType'),
++  }
++}
++
++// ── Add a nozzle to an existing dispenser (ADMIN/MANAGER) ──────
++export async function addNozzle(
++  dispenserId: string,
++  formData: FormData,
++): Promise<NozzleActionResult> {
++  try {
++    const actor = await requireRole(['ADMIN', 'MANAGER'])
++    if (!dispenserId) return { success: false, error: 'Dispenser ID is required' }
++
++    const dispenser = await prisma.dispenser.findUnique({
++      where: { id: dispenserId },
++      select: { branchId: true },
++    })
++    if (!dispenser) return { success: false, error: 'Dispenser not found' }
++
++    await requireBranchAccess(dispenser.branchId)
++
++    const parsed = nozzleInputSchema.safeParse(readNozzleFormData(formData))
++    if (!parsed.success) {
++      return { success: false, error: firstZodMessage(parsed.error) }
++    }
++
++    await prisma.nozzle.create({
++      data: {
++        dispenserID: dispenserId,
++        nozzleNumber: parsed.data.nozzleNumber,
++        fuelType: parsed.data.fuelType,
++        createdBy: actor.id,
++      },
++    })
++
++    revalidatePath('/dispensers')
++    return { success: true }
++  } catch (error: unknown) {
++    if (error instanceof ForbiddenError) {
++      return { success: false, error: error.message }
++    }
++    if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
++      return { success: false, error: 'A nozzle with this number already exists on this dispenser' }
++    }
++    console.error('Failed to add nozzle:', error)
++    return { success: false, error: 'Failed to add nozzle' }
++  }
++}
++
++// ── Edit a nozzle's number/fuel type (ADMIN/MANAGER) ────────────
++export async function updateNozzle(
++  nozzleId: string,
++  formData: FormData,
++): Promise<NozzleActionResult> {
++  try {
++    const actor = await requireRole(['ADMIN', 'MANAGER'])
++    if (!nozzleId) return { success: false, error: 'Nozzle ID is required' }
++
++    const nozzle = await prisma.nozzle.findUnique({
++      where: { id: nozzleId },
++      select: { dispenser: { select: { branchId: true } } },
++    })
++    if (!nozzle) return { success: false, error: 'Nozzle not found' }
++
++    await requireBranchAccess(nozzle.dispenser.branchId)
++
++    const parsed = nozzleInputSchema.safeParse(readNozzleFormData(formData))
++    if (!parsed.success) {
++      return { success: false, error: firstZodMessage(parsed.error) }
++    }
++
++    await prisma.nozzle.update({
++      where: { id: nozzleId },
++      data: {
++        nozzleNumber: parsed.data.nozzleNumber,
++        fuelType: parsed.data.fuelType,
++        updatedBy: actor.id,
++      },
++    })
++
++    revalidatePath('/dispensers')
++    return { success: true }
++  } catch (error: unknown) {
++    if (error instanceof ForbiddenError) {
++      return { success: false, error: error.message }
++    }
++    if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
++      return { success: false, error: 'A nozzle with this number already exists on this dispenser' }
++    }
++    if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2025') {
++      return { success: false, error: 'Nozzle not found' }
++    }
++    console.error('Failed to update nozzle:', error)
++    return { success: false, error: 'Failed to update nozzle' }
++  }
++}
++
++// ── Decommission / restore a nozzle (ADMIN/MANAGER) ─────────────
++// Soft-disabled, never deleted: historical sales must keep a valid FK.
++export async function setNozzleActive(
++  nozzleId: string,
++  isActive: boolean,
++): Promise<NozzleActionResult> {
++  try {
++    const actor = await requireRole(['ADMIN', 'MANAGER'])
++
++    const nozzle = await prisma.nozzle.findUnique({
++      where: { id: nozzleId },
++      select: { dispenser: { select: { branchId: true } } },
++    })
++    if (!nozzle) return { success: false, error: 'Nozzle not found' }
++
++    await requireBranchAccess(nozzle.dispenser.branchId)
++
++    await prisma.nozzle.update({
++      where: { id: nozzleId },
++      data: { isActive, updatedBy: actor.id },
++    })
++
++    revalidatePath('/dispensers')
++    return { success: true }
++  } catch (error: unknown) {
++    if (error instanceof ForbiddenError) {
++      return { success: false, error: error.message }
++    }
++    console.error('Failed to update nozzle status:', error)
++    return { success: false, error: 'Failed to update nozzle status' }
++  }
++}
+diff --git a/src/app/actions/pump.actions.ts b/src/app/actions/pump.actions.ts
+deleted file mode 100644
+index 1ef28ce..0000000
+--- a/src/app/actions/pump.actions.ts
++++ /dev/null
+@@ -1,270 +0,0 @@
+-'use server'
+-
+-import { prisma } from '@/lib/prisma'
+-import { revalidatePath } from 'next/cache'
+-
+-import { FuelType, Prisma } from '../../../prisma/generated/client'
+-
+-export type PumpActionResult = {
+-  success: boolean
+-  error?: string
+-}
+-
+-/**
+- * Update dispenser status.
+- */
+-export async function updatePumpStatus(
+-  dispenserId: string,
+-  status: 'IDLE' | 'ACTIVE' | 'MAINTENANCE' | 'OFFLINE',
+-): Promise<PumpActionResult> {
+-  if (!dispenserId) {
+-    return {
+-      success: false,
+-      error: 'Dispenser ID is required',
+-    }
+-  }
+-
+-  try {
+-    await prisma.dispenser.update({
+-      where: {
+-        id: dispenserId,
+-      },
+-      data: {
+-        status,
+-      },
+-    })
+-
+-    revalidatePath('/pumps')
+-    revalidatePath('/dashboard')
+-
+-    return {
+-      success: true,
+-    }
+-  } catch (error: unknown) {
+-    console.error('Failed to update dispenser status:', error)
+-
+-    return {
+-      success: false,
+-      error: 'Failed to update dispenser status',
+-    }
+-  }
+-}
+-
+-/**
+- * A meter reading belongs to a nozzle, not the dispenser.
+- */
+-export async function updateNozzleReading(
+-  nozzleId: string,
+-  reading: number,
+-): Promise<PumpActionResult> {
+-  if (!nozzleId) {
+-    return {
+-      success: false,
+-      error: 'Nozzle ID is required',
+-    }
+-  }
+-
+-  if (!Number.isFinite(reading) || reading < 0) {
+-    return {
+-      success: false,
+-      error: 'Enter a valid meter reading',
+-    }
+-  }
+-
+-  try {
+-    await prisma.nozzle.update({
+-      where: {
+-        id: nozzleId,
+-      },
+-      data: {
+-        currentReading: reading.toFixed(3),
+-      },
+-    })
+-
+-    revalidatePath('/pumps')
+-    revalidatePath('/dashboard')
+-
+-    return {
+-      success: true,
+-    }
+-  } catch (error: unknown) {
+-    console.error('Failed to update nozzle reading:', error)
+-
+-    return {
+-      success: false,
+-      error: 'Failed to update nozzle reading',
+-    }
+-  }
+-}
+-
+-/**
+- * Create one dispenser and all its nozzles atomically.
+- */
+-export async function addPump(
+-  formData: FormData,
+-): Promise<PumpActionResult> {
+-  const branchId = String(
+-    formData.get('branchId') ?? '',
+-  ).trim()
+-
+-  const dispenserNumber = Number(
+-    formData.get('dispenserNumber'),
+-  )
+-
+-  const nozzleCount = Number(
+-    formData.get('nozzleCount'),
+-  )
+-
+-  if (!branchId) {
+-    return {
+-      success: false,
+-      error: 'Branch is required',
+-    }
+-  }
+-
+-  if (
+-    !Number.isInteger(dispenserNumber) ||
+-    dispenserNumber <= 0
+-  ) {
+-    return {
+-      success: false,
+-      error: 'Enter a valid dispenser number',
+-    }
+-  }
+-
+-  if (
+-    !Number.isInteger(nozzleCount) ||
+-    nozzleCount < 1 ||
+-    nozzleCount > 12
+-  ) {
+-    return {
+-      success: false,
+-      error: 'A dispenser must have between 1 and 12 nozzles',
+-    }
+-  }
+-
+-  const nozzles: Array<{
+-    nozzleNumber: number
+-    fuelType: FuelType
+-    currentReading: string
+-  }> = []
+-
+-  const validFuelTypes = Object.values(FuelType)
+-
+-  for (let index = 0; index < nozzleCount; index += 1) {
+-    const nozzleNumber = Number(
+-      formData.get(`nozzleNumber_${index}`),
+-    )
+-
+-    const fuelType = String(
+-      formData.get(`fuelType_${index}`) ?? '',
+-    ) as FuelType
+-
+-    const currentReading = Number(
+-      formData.get(`currentReading_${index}`),
+-    )
+-
+-    if (
+-      !Number.isInteger(nozzleNumber) ||
+-      nozzleNumber <= 0
+-    ) {
+-      return {
+-        success: false,
+-        error: `Enter a valid number for nozzle ${index + 1}`,
+-      }
+-    }
+-
+-    if (!validFuelTypes.includes(fuelType)) {
+-      return {
+-        success: false,
+-        error: `Select a valid fuel type for nozzle ${nozzleNumber}`,
+-      }
+-    }
+-
+-    if (
+-      !Number.isFinite(currentReading) ||
+-      currentReading < 0
+-    ) {
+-      return {
+-        success: false,
+-        error: `Enter a valid reading for nozzle ${nozzleNumber}`,
+-      }
+-    }
+-
+-    nozzles.push({
+-      nozzleNumber,
+-      fuelType,
+-      currentReading: currentReading.toFixed(3),
+-    })
+-  }
+-
+-  const nozzleNumbers = nozzles.map(
+-    nozzle => nozzle.nozzleNumber,
+-  )
+-
+-  if (
+-    new Set(nozzleNumbers).size !==
+-    nozzleNumbers.length
+-  ) {
+-    return {
+-      success: false,
+-      error: 'Nozzle numbers cannot be duplicated',
+-    }
+-  }
+-
+-  const branchExists = await prisma.branch.findUnique({
+-    where: {
+-      id: branchId,
+-    },
+-    select: {
+-      id: true,
+-    },
+-  })
+-
+-  if (!branchExists) {
+-    return {
+-      success: false,
+-      error: 'The selected branch does not exist',
+-    }
+-  }
+-
+-  try {
+-    await prisma.dispenser.create({
+-      data: {
+-        branchId,
+-        dispenserNumber,
+-        status: 'IDLE',
+-
+-        nozzles: {
+-          create: nozzles,
+-        },
+-      },
+-    })
+-
+-    revalidatePath('/pumps')
+-    revalidatePath('/dashboard')
+-
+-    return {
+-      success: true,
+-    }
+-  } catch (error: unknown) {
+-    console.error('Failed to create dispenser:', error)
+-
+-    if (
+-      error instanceof
+-      Prisma.PrismaClientKnownRequestError &&
+-      error.code === 'P2002'
+-    ) {
+-      return {
+-        success: false,
+-        error:
+-          'The dispenser number or nozzle number already exists',
+-      }
+-    }
+-
+-    return {
+-      success: false,
+-      error: 'Failed to create dispenser',
+-    }
+-  }
+-}
+\ No newline at end of file
+diff --git a/src/app/actions/tank.actions.ts b/src/app/actions/tank.actions.ts
+new file mode 100644
+index 0000000..751feee
+--- /dev/null
++++ b/src/app/actions/tank.actions.ts
+@@ -0,0 +1,151 @@
++'use server'
++
++import { revalidatePath } from 'next/cache'
++import { prisma } from '@/lib/prisma'
++import { requireRole, requireBranchAccess, ForbiddenError } from '@/lib/rbac'
++import { Prisma } from '../../../prisma/generated/client'
++import { tankInputSchema, firstZodMessage } from '@/lib/validation/equipment.schema'
++
++export type TankActionResult = {
++  success: boolean
++  error?: string
++}
++
++function readTankFormData(formData: FormData) {
++  return {
++    branchId: formData.get('branchId'),
++    tankNumber: formData.get('tankNumber'),
++    fuelType: formData.get('fuelType'),
++    capacity: formData.get('capacity'),
++    currentLevel: formData.get('currentLevel'),
++    minLevel: formData.get('minLevel'),
++  }
++}
++
++// ── Create a tank (ADMIN or MANAGER, within an accessible branch) ──
++export async function createTank(formData: FormData): Promise<TankActionResult> {
++  try {
++    const actor = await requireRole(['ADMIN', 'MANAGER'])
++
++    const parsed = tankInputSchema.safeParse(readTankFormData(formData))
++    if (!parsed.success) {
++      return { success: false, error: firstZodMessage(parsed.error) }
++    }
++    const data = parsed.data
++
++    await requireBranchAccess(data.branchId)
++
++    await prisma.fuelTank.create({
++      data: {
++        branchId: data.branchId,
++        tankNumber: data.tankNumber,
++        fuelType: data.fuelType,
++        capacity: data.capacity,
++        currentLevel: data.currentLevel,
++        minLevel: data.minLevel,
++        createdBy: actor.id,
++      },
++    })
++
++    revalidatePath('/fuel')
++    revalidatePath('/dashboard')
++    return { success: true }
++  } catch (error: unknown) {
++    if (error instanceof ForbiddenError) {
++      return { success: false, error: error.message }
++    }
++    if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
++      return { success: false, error: 'A tank with this number already exists at this branch' }
++    }
++    console.error('Failed to create tank:', error)
++    return { success: false, error: 'Failed to create tank' }
++  }
++}
++
++// ── Update a tank (ADMIN or MANAGER, within an accessible branch) ──
++export async function updateTank(tankId: string, formData: FormData): Promise<TankActionResult> {
++  try {
++    const actor = await requireRole(['ADMIN', 'MANAGER'])
++
++    if (!tankId) return { success: false, error: 'Tank ID is required' }
++
++    const existing = await prisma.fuelTank.findUnique({
++      where: { id: tankId },
++      select: { branchId: true },
++    })
++    if (!existing) return { success: false, error: 'Tank not found' }
++
++    const parsed = tankInputSchema.safeParse(readTankFormData(formData))
++    if (!parsed.success) {
++      return { success: false, error: firstZodMessage(parsed.error) }
++    }
++    const data = parsed.data
++
++    // Must have access to both the tank's current branch and its target branch.
++    await requireBranchAccess(existing.branchId)
++    if (data.branchId !== existing.branchId) {
++      await requireBranchAccess(data.branchId)
++    }
++
++    await prisma.fuelTank.update({
++      where: { id: tankId },
++      data: {
++        branchId: data.branchId,
++        tankNumber: data.tankNumber,
++        fuelType: data.fuelType,
++        capacity: data.capacity,
++        currentLevel: data.currentLevel,
++        minLevel: data.minLevel,
++        updatedBy: actor.id,
++      },
++    })
++
++    revalidatePath('/fuel')
++    revalidatePath('/dashboard')
++    return { success: true }
++  } catch (error: unknown) {
++    if (error instanceof ForbiddenError) {
++      return { success: false, error: error.message }
++    }
++    if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
++      return { success: false, error: 'A tank with this number already exists at this branch' }
++    }
++    if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2025') {
++      return { success: false, error: 'Tank not found' }
++    }
++    console.error('Failed to update tank:', error)
++    return { success: false, error: 'Failed to update tank' }
++  }
++}
++
++// ── Decommission / restore a tank (ADMIN or MANAGER) ──────────
++// Tanks are soft-disabled, never deleted: deliveries and historical
++// reconciliation records must keep a valid foreign key.
++export async function setTankActive(tankId: string, isActive: boolean): Promise<TankActionResult> {
++  try {
++    const actor = await requireRole(['ADMIN', 'MANAGER'])
++
++    const existing = await prisma.fuelTank.findUnique({
++      where: { id: tankId },
++      select: { branchId: true },
++    })
++    if (!existing) return { success: false, error: 'Tank not found' }
++
++    await requireBranchAccess(existing.branchId)
++
++    await prisma.fuelTank.update({
++      where: { id: tankId },
++      data: { isActive, updatedBy: actor.id },
++    })
++
++    revalidatePath('/fuel')
++    revalidatePath('/dashboard')
++    return { success: true }
++  } catch (error: unknown) {
++    if (error instanceof ForbiddenError) {
++      return { success: false, error: error.message }
++    }
++    console.error('Failed to update tank status:', error)
++    return { success: false, error: 'Failed to update tank status' }
++  }
++}
+diff --git a/src/components/dispensers/AddNozzleForm.tsx b/src/components/dispensers/AddNozzleForm.tsx
+index e69de29..a92658a 100644
+--- a/src/components/dispensers/AddNozzleForm.tsx
++++ b/src/components/dispensers/AddNozzleForm.tsx
+@@ -0,0 +1,99 @@
++'use client'
++
++import { useState, useTransition } from 'react'
++import { Plus, X } from 'lucide-react'
++import { addNozzle } from '@/app/actions/nozzle.actions'
++
++type FuelType = 'PETROL_91' | 'PETROL_95' | 'DIESEL' | 'PREMIUM_DIESEL'
++
++type AddNozzleFormProps = {
++  dispenserId: string
++  nextNozzleNumber: number
++}
++
++const fuelTypeOptions: Array<{ value: FuelType; label: string }> = [
++  { value: 'PETROL_91', label: 'Petrol 91' },
++  { value: 'PETROL_95', label: 'Petrol 95' },
++  { value: 'DIESEL', label: 'Diesel' },
++  { value: 'PREMIUM_DIESEL', label: 'Premium Diesel' },
++]
++
++export default function AddNozzleForm({ dispenserId, nextNozzleNumber }: AddNozzleFormProps) {
++  const [isOpen, setIsOpen] = useState(false)
++  const [nozzleNumber, setNozzleNumber] = useState(String(nextNozzleNumber))
++  const [fuelType, setFuelType] = useState<FuelType>('PETROL_91')
++  const [error, setError] = useState<string | null>(null)
++  const [isPending, startTransition] = useTransition()
++
++  function handleSubmit() {
++    setError(null)
++    const formData = new FormData()
++    formData.set('nozzleNumber', nozzleNumber)
++    formData.set('fuelType', fuelType)
++
++    startTransition(async () => {
++      const result = await addNozzle(dispenserId, formData)
++      if (!result.success) {
++        setError(result.error ?? 'Failed to add nozzle')
++        return
++      }
++      setIsOpen(false)
++      setNozzleNumber(String(nextNozzleNumber + 1))
++    })
++  }
++
++  if (!isOpen) {
++    return (
++      <button
++        type="button"
++        onClick={() => setIsOpen(true)}
++        className="flex w-full items-center justify-center gap-1.5 rounded-lg border border-dashed border-gray-300 py-2 text-xs font-medium text-gray-500 hover:border-amber-400 hover:text-amber-600"
++      >
++        <Plus size={14} />
++        Add nozzle
++      </button>
++    )
++  }
++
++  return (
++    <div className="rounded-lg border border-gray-200 bg-gray-50 p-3">
++      <div className="flex items-center gap-2">
++        <input
++          type="number"
++          min={1}
++          value={nozzleNumber}
++          onChange={event => setNozzleNumber(event.target.value)}
++          className="w-16 rounded-lg border border-gray-300 px-2 py-1.5 text-sm focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500"
++          placeholder="No."
++        />
++        <select
++          value={fuelType}
++          onChange={event => setFuelType(event.target.value as FuelType)}
++          className="flex-1 rounded-lg border border-gray-300 px-2 py-1.5 text-sm focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500"
++        >
++          {fuelTypeOptions.map(option => (
++            <option key={option.value} value={option.value}>
++              {option.label}
++            </option>
++          ))}
++        </select>
++        <button
++          type="button"
++          onClick={handleSubmit}
++          disabled={isPending}
++          className="rounded-lg bg-amber-500 px-3 py-1.5 text-xs font-medium text-gray-900 hover:bg-amber-400 disabled:opacity-60"
++        >
++          {isPending ? 'Adding…' : 'Add'}
++        </button>
++        <button
++          type="button"
++          onClick={() => setIsOpen(false)}
++          className="rounded-lg p-1.5 text-gray-400 hover:bg-gray-100 hover:text-gray-700"
++        >
++          <X size={14} />
++        </button>
++      </div>
++      {error ? <p className="mt-1.5 text-xs text-red-500">{error}</p> : null}
++    </div>
++  )
++}
+diff --git a/src/components/dispensers/AddPumpForm.tsx b/src/components/dispensers/AddPumpForm.tsx
+deleted file mode 100644
+index 3e28122..0000000
+--- a/src/components/dispensers/AddPumpForm.tsx
++++ /dev/null
+@@ -1,484 +0,0 @@
+-'use client'
+-
+-import {
+-  useRef,
+-  useState,
+-  useTransition,
+-} from 'react'
+-import { useRouter } from 'next/navigation'
+-import {
+-  Loader2,
+-  Plus,
+-  Trash2,
+-  X,
+-} from 'lucide-react'
+-
+-import { addPump } from '@/app/actions/pump.actions'
+-
+-type FuelType =
+-  | 'PETROL_91'
+-  | 'PETROL_95'
+-  | 'DIESEL'
+-  | 'PREMIUM_DIESEL'
+-
+-type NozzleRow = {
+-  rowId: number
+-  nozzleNumber: string
+-  fuelType: FuelType
+-  currentReading: string
+-}
+-
+-type AddPumpFormProps = {
+-  branchId: string
+-}
+-
+-const fuelTypeOptions: Array<{
+-  value: FuelType
+-  label: string
+-}> = [
+-    {
+-      value: 'PETROL_91',
+-      label: 'Petrol 91',
+-    },
+-    {
+-      value: 'PETROL_95',
+-      label: 'Petrol 95',
+-    },
+-    {
+-      value: 'DIESEL',
+-      label: 'Diesel',
+-    },
+-    {
+-      value: 'PREMIUM_DIESEL',
+-      label: 'Premium Diesel',
+-    },
+-  ]
+-
+-function getInitialNozzles(): NozzleRow[] {
+-  return [
+-    {
+-      rowId: 1,
+-      nozzleNumber: '1',
+-      fuelType: 'PETROL_91',
+-      currentReading: '0.000',
+-    },
+-    {
+-      rowId: 2,
+-      nozzleNumber: '2',
+-      fuelType: 'PETROL_95',
+-      currentReading: '0.000',
+-    },
+-  ]
+-}
+-
+-export default function AddPumpForm({
+-  branchId,
+-}: AddPumpFormProps) {
+-  const router = useRouter()
+-  const nextRowId = useRef(3)
+-
+-  const [open, setOpen] = useState(false)
+-  const [error, setError] = useState('')
+-  const [isPending, startTransition] =
+-    useTransition()
+-
+-  const [dispenserNumber, setDispenserNumber] =
+-    useState('')
+-
+-  const [nozzles, setNozzles] =
+-    useState<NozzleRow[]>(getInitialNozzles())
+-
+-  function resetForm(): void {
+-    setDispenserNumber('')
+-    setNozzles(getInitialNozzles())
+-    nextRowId.current = 3
+-    setError('')
+-  }
+-
+-  function closeModal(): void {
+-    if (isPending) {
+-      return
+-    }
+-
+-    setOpen(false)
+-    resetForm()
+-  }
+-
+-  function addNozzle(): void {
+-    if (nozzles.length >= 12) {
+-      setError(
+-        'A dispenser can contain a maximum of 12 nozzles',
+-      )
+-      return
+-    }
+-
+-    const existingNozzleNumbers = nozzles
+-      .map(nozzle => Number(nozzle.nozzleNumber))
+-      .filter(Number.isFinite)
+-
+-    const nextNozzleNumber =
+-      existingNozzleNumbers.length > 0
+-        ? Math.max(...existingNozzleNumbers) + 1
+-        : 1
+-
+-    setNozzles(current => [
+-      ...current,
+-      {
+-        rowId: nextRowId.current++,
+-        nozzleNumber: String(nextNozzleNumber),
+-        fuelType: 'PETROL_91',
+-        currentReading: '0.000',
+-      },
+-    ])
+-
+-    setError('')
+-  }
+-
+-  function removeNozzle(rowId: number): void {
+-    if (nozzles.length === 1) {
+-      setError(
+-        'A dispenser must contain at least one nozzle',
+-      )
+-      return
+-    }
+-
+-    setNozzles(current =>
+-      current.filter(
+-        nozzle => nozzle.rowId !== rowId,
+-      ),
+-    )
+-
+-    setError('')
+-  }
+-
+-  function updateNozzle(
+-    rowId: number,
+-    field:
+-      | 'nozzleNumber'
+-      | 'fuelType'
+-      | 'currentReading',
+-    value: string,
+-  ): void {
+-    setNozzles(current =>
+-      current.map(nozzle =>
+-        nozzle.rowId === rowId
+-          ? {
+-            ...nozzle,
+-            [field]: value,
+-          }
+-          : nozzle,
+-      ),
+-    )
+-  }
+-
+-  function handleSubmit(
+-    formData: FormData,
+-  ): void {
+-    setError('')
+-
+-    startTransition(() => {
+-      void addPump(formData).then(result => {
+-        if (!result.success) {
+-          setError(
+-            result.error ?? 'Something went wrong',
+-          )
+-          return
+-        }
+-
+-        setOpen(false)
+-        resetForm()
+-        router.refresh()
+-      })
+-    })
+-  }
+-
+-  return (
+-    <>
+-      <button
+-        type="button"
+-        onClick={() => setOpen(true)}
+-        className="flex items-center gap-2 rounded-lg bg-amber-500 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-amber-600"
+-      >
+-        <Plus size={16} />
+-        Add Dispenser
+-      </button>
+-
+-      {open && (
+-        <div
+-          className="fixed inset-0 z-40 flex items-center justify-center bg-black/40 p-4"
+-          role="dialog"
+-          aria-modal="true"
+-          aria-labelledby="add-dispenser-title"
+-        >
+-          <div className="z-50 max-h-[92vh] w-full max-w-3xl overflow-y-auto rounded-2xl bg-white shadow-xl">
+-            <div className="sticky top-0 z-10 flex items-center justify-between border-b border-gray-200 bg-white px-6 py-5">
+-              <div>
+-                <h2
+-                  id="add-dispenser-title"
+-                  className="text-lg font-semibold text-gray-800"
+-                >
+-                  Add New Dispenser
+-                </h2>
+-
+-                <p className="mt-1 text-sm text-gray-500">
+-                  Add the dispenser and configure its
+-                  nozzles.
+-                </p>
+-              </div>
+-
+-              <button
+-                type="button"
+-                onClick={closeModal}
+-                disabled={isPending}
+-                className="rounded-lg p-1 text-gray-400 hover:bg-gray-100 hover:text-gray-600 disabled:opacity-50"
+-                aria-label="Close"
+-              >
+-                <X size={20} />
+-              </button>
+-            </div>
+-
+-            <form
+-              action={handleSubmit}
+-              className="space-y-5 p-6"
+-            >
+-              <input
+-                type="hidden"
+-                name="branchId"
+-                value={branchId}
+-              />
+-
+-              <input
+-                type="hidden"
+-                name="nozzleCount"
+-                value={nozzles.length}
+-              />
+-
+-              <div>
+-                <label
+-                  htmlFor="dispenserNumber"
+-                  className="mb-1 block text-sm font-medium text-gray-700"
+-                >
+-                  Dispenser Number
+-                </label>
+-
+-                <input
+-                  id="dispenserNumber"
+-                  name="dispenserNumber"
+-                  type="number"
+-                  min="1"
+-                  step="1"
+-                  required
+-                  value={dispenserNumber}
+-                  onChange={event =>
+-                    setDispenserNumber(
+-                      event.target.value,
+-                    )
+-                  }
+-                  disabled={isPending}
+-                  placeholder="e.g. 1"
+-                  className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-amber-500 disabled:bg-gray-100"
+-                />
+-              </div>
+-
+-              <section className="overflow-hidden rounded-xl border border-gray-200">
+-                <div className="flex items-center justify-between border-b border-gray-200 bg-gray-50 px-4 py-3">
+-                  <div>
+-                    <h3 className="text-sm font-semibold text-gray-800">
+-                      Nozzles
+-                    </h3>
+-
+-                    <p className="mt-0.5 text-xs text-gray-500">
+-                      Each nozzle has an independent fuel
+-                      type and meter reading.
+-                    </p>
+-                  </div>
+-
+-                  <button
+-                    type="button"
+-                    onClick={addNozzle}
+-                    disabled={
+-                      isPending ||
+-                      nozzles.length >= 12
+-                    }
+-                    className="flex items-center gap-1.5 rounded-lg border border-amber-300 bg-white px-3 py-2 text-xs font-semibold text-amber-700 transition-colors hover:bg-amber-50 disabled:cursor-not-allowed disabled:opacity-50"
+-                  >
+-                    <Plus size={14} />
+-                    Add Nozzle
+-                  </button>
+-                </div>
+-
+-                <div className="divide-y divide-gray-200">
+-                  {nozzles.map(
+-                    (nozzle, index) => (
+-                      <div
+-                        key={nozzle.rowId}
+-                        className="grid grid-cols-1 gap-4 p-4 md:grid-cols-[120px_1fr_180px_40px]"
+-                      >
+-                        <div>
+-                          <label
+-                            htmlFor={`nozzleNumber-${nozzle.rowId}`}
+-                            className="mb-1 block text-xs font-medium text-gray-600"
+-                          >
+-                            Nozzle No.
+-                          </label>
+-
+-                          <input
+-                            id={`nozzleNumber-${nozzle.rowId}`}
+-                            name={`nozzleNumber_${index}`}
+-                            type="number"
+-                            min="1"
+-                            step="1"
+-                            required
+-                            value={
+-                              nozzle.nozzleNumber
+-                            }
+-                            onChange={event =>
+-                              updateNozzle(
+-                                nozzle.rowId,
+-                                'nozzleNumber',
+-                                event.target.value,
+-                              )
+-                            }
+-                            disabled={isPending}
+-                            className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-amber-500 disabled:bg-gray-100"
+-                          />
+-                        </div>
+-
+-                        <div>
+-                          <label
+-                            htmlFor={`fuelType-${nozzle.rowId}`}
+-                            className="mb-1 block text-xs font-medium text-gray-600"
+-                          >
+-                            Fuel Type
+-                          </label>
+-
+-                          <select
+-                            id={`fuelType-${nozzle.rowId}`}
+-                            name={`fuelType_${index}`}
+-                            required
+-                            value={nozzle.fuelType}
+-                            onChange={event =>
+-                              updateNozzle(
+-                                nozzle.rowId,
+-                                'fuelType',
+-                                event.target.value,
+-                              )
+-                            }
+-                            disabled={isPending}
+-                            className="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-amber-500 disabled:bg-gray-100"
+-                          >
+-                            {fuelTypeOptions.map(
+-                              option => (
+-                                <option
+-                                  key={option.value}
+-                                  value={option.value}
+-                                >
+-                                  {option.label}
+-                                </option>
+-                              ),
+-                            )}
+-                          </select>
+-                        </div>
+-
+-                        <div>
+-                          <label
+-                            htmlFor={`currentReading-${nozzle.rowId}`}
+-                            className="mb-1 block text-xs font-medium text-gray-600"
+-                          >
+-                            Initial Reading (L)
+-                          </label>
+-
+-                          <input
+-                            id={`currentReading-${nozzle.rowId}`}
+-                            name={`currentReading_${index}`}
+-                            type="number"
+-                            min="0"
+-                            step="0.001"
+-                            required
+-                            value={
+-                              nozzle.currentReading
+-                            }
+-                            onChange={event =>
+-                              updateNozzle(
+-                                nozzle.rowId,
+-                                'currentReading',
+-                                event.target.value,
+-                              )
+-                            }
+-                            disabled={isPending}
+-                            placeholder="0.000"
+-                            className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-amber-500 disabled:bg-gray-100"
+-                          />
+-                        </div>
+-
+-                        <div className="flex items-end">
+-                          <button
+-                            type="button"
+-                            onClick={() =>
+-                              removeNozzle(
+-                                nozzle.rowId,
+-                              )
+-                            }
+-                            disabled={
+-                              isPending ||
+-                              nozzles.length === 1
+-                            }
+-                            className="flex h-10 w-10 items-center justify-center rounded-lg text-gray-400 transition-colors hover:bg-red-50 hover:text-red-600 disabled:cursor-not-allowed disabled:opacity-30"
+-                            aria-label={`Remove nozzle ${nozzle.nozzleNumber}`}
+-                          >
+-                            <Trash2 size={17} />
+-                          </button>
+-                        </div>
+-                      </div>
+-                    ),
+-                  )}
+-                </div>
+-              </section>
+-
+-              {error && (
+-                <p
+-                  role="alert"
+-                  className="rounded-lg bg-red-50 px-3 py-2 text-sm text-red-600"
+-                >
+-                  {error}
+-                </p>
+-              )}
+-
+-              <div className="flex gap-3 border-t border-gray-200 pt-5">
+-                <button
+-                  type="button"
+-                  onClick={closeModal}
+-                  disabled={isPending}
+-                  className="flex-1 rounded-lg border border-gray-300 px-4 py-2.5 text-sm text-gray-700 transition-colors hover:bg-gray-50 disabled:opacity-50"
+-                >
+-                  Cancel
+-                </button>
+-
+-                <button
+-                  type="submit"
+-                  disabled={isPending}
+-                  className="flex flex-1 items-center justify-center gap-2 rounded-lg bg-amber-500 px-4 py-2.5 text-sm font-medium text-white transition-colors hover:bg-amber-600 disabled:opacity-50"
+-                >
+-                  {isPending ? (
+-                    <>
+-                      <Loader2
+-                        size={16}
+-                        className="animate-spin"
+-                      />
+-                      Adding...
+-                    </>
+-                  ) : (
+-                    <>
+-                      <Plus size={16} />
+-                      Add Dispenser
+-                    </>
+-                  )}
+-                </button>
+-              </div>
+-            </form>
+-          </div>
+-        </div>
+-      )}
+-    </>
+-  )
+-}
+\ No newline at end of file
+diff --git a/src/components/dispensers/DispenserCard.tsx b/src/components/dispensers/DispenserCard.tsx
+new file mode 100644
+index 0000000..8c43a66
+--- /dev/null
++++ b/src/components/dispensers/DispenserCard.tsx
+@@ -0,0 +1,148 @@
++import { Fuel } from 'lucide-react'
++import DispenserStatusButton from './DispenserStatusButton'
++import AddNozzleForm from './AddNozzleForm'
++import ActiveToggle from '@/components/shared/ActiveToggle'
++import { setDispenserActive } from '@/app/actions/dispenser.actions'
++import { setNozzleActive } from '@/app/actions/nozzle.actions'
++import type { Prisma } from '../../../prisma/generated/client'
++
++type DispenserWithNozzles = Prisma.DispenserGetPayload<{
++  include: { nozzles: true }
++}>
++
++type DispenserCardProps = {
++  dispenser: DispenserWithNozzles
++  canManage: boolean
++}
++
++const fuelLabels: Record<string, { label: string; color: string }> = {
++  PETROL_91: { label: 'Petrol 91', color: 'bg-blue-100 text-blue-700' },
++  PETROL_95: { label: 'Petrol 95', color: 'bg-indigo-100 text-indigo-700' },
++  DIESEL: { label: 'Diesel', color: 'bg-yellow-100 text-yellow-700' },
++  PREMIUM_DIESEL: { label: 'Premium Diesel', color: 'bg-orange-100 text-orange-700' },
++}
++
++const borderColor: Record<string, string> = {
++  ACTIVE: 'border-l-green-500',
++  IDLE: 'border-l-gray-300',
++  MAINTENANCE: 'border-l-amber-500',
++  OFFLINE: 'border-l-red-500',
++}
++
++export default function DispenserCard({ dispenser, canManage }: DispenserCardProps) {
++  const statusBorder = dispenser.isActive
++    ? (borderColor[dispenser.status] ?? borderColor.IDLE)
++    : 'border-l-gray-200'
++
++  const activeNozzles = dispenser.nozzles.filter(nozzle => nozzle.isActive)
++  const nextNozzleNumber =
++    dispenser.nozzles.reduce((max, nozzle) => Math.max(max, nozzle.nozzleNumber), 0) + 1
++
++  return (
++    <article
++      className={`flex flex-col gap-4 rounded-xl border border-l-4 border-gray-200 bg-white p-5 ${statusBorder} ${
++        dispenser.isActive ? '' : 'opacity-60'
++      }`}
++    >
++      {/* Dispenser header */}
++      <div className="flex items-start justify-between gap-4">
++        <div className="flex items-center gap-3">
++          <div className="rounded-lg bg-gray-100 p-2.5">
++            <Fuel size={20} className="text-gray-600" />
++          </div>
++
++          <div>
++            <p className="text-xs font-medium uppercase tracking-wide text-gray-400">
++              Dispenser
++            </p>
++            <h2 className="text-lg font-bold text-gray-800">#{dispenser.dispenserNumber}</h2>
++            <p className="mt-0.5 text-xs text-gray-500">
++              {activeNozzles.length} {activeNozzles.length === 1 ? 'nozzle' : 'nozzles'}
++              {!dispenser.isActive ? ' · Decommissioned' : ''}
++            </p>
++          </div>
++        </div>
++
++        <div className="flex items-center gap-1">
++          {canManage ? (
++            <DispenserStatusButton dispenserId={dispenser.id} currentStatus={dispenser.status} />
++          ) : (
++            <span className="rounded-full bg-gray-100 px-2.5 py-1 text-xs font-semibold text-gray-600">
++              {dispenser.status}
++            </span>
++          )}
++
++          {canManage ? (
++            <ActiveToggle
++              id={dispenser.id}
++              isActive={dispenser.isActive}
++              action={setDispenserActive}
++              confirmDisableMessage="Decommission this dispenser? It will be hidden from active use but its sales history is preserved."
++            />
++          ) : null}
++        </div>
++      </div>
++
++      {/* Nozzles */}
++      <div className="space-y-3 border-t border-gray-100 pt-4">
++        {dispenser.nozzles.length === 0 ? (
++          <div className="rounded-lg border border-dashed border-gray-300 px-4 py-5 text-center">
++            <p className="text-sm text-gray-500">No nozzles configured for this dispenser.</p>
++          </div>
++        ) : (
++          dispenser.nozzles.map(nozzle => {
++            const fuel = fuelLabels[nozzle.fuelType] ?? {
++              label: nozzle.fuelType,
++              color: 'bg-gray-100 text-gray-600',
++            }
++            const reading = Number(nozzle.currentReading)
++
++            return (
++              <div
++                key={nozzle.id}
++                className={`rounded-lg border border-gray-200 bg-gray-50 p-3 ${
++                  nozzle.isActive ? '' : 'opacity-50'
++                }`}
++              >
++                <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
++                  <div>
++                    <div className="flex items-center gap-2">
++                      <p className="text-sm font-semibold text-gray-800">
++                        Nozzle #{nozzle.nozzleNumber}
++                      </p>
++                      <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${fuel.color}`}>
++                        {fuel.label}
++                      </span>
++                      {!nozzle.isActive ? (
++                        <span className="rounded-full bg-gray-200 px-2 py-0.5 text-xs font-medium text-gray-500">
++                          Decommissioned
++                        </span>
++                      ) : null}
++                    </div>
++                    <p className="mt-1 text-xs text-gray-400">
++                      Totalizer: {reading.toFixed(3)} L
++                    </p>
++                  </div>
++
++                  {canManage ? (
++                    <ActiveToggle
++                      id={nozzle.id}
++                      isActive={nozzle.isActive}
++                      action={setNozzleActive}
++                      confirmDisableMessage="Decommission this nozzle? It will be hidden from active use but its sales history is preserved."
++                      size={14}
++                    />
++                  ) : null}
++                </div>
++              </div>
++            )
++          })
++        )}
++
++        {canManage && dispenser.isActive ? (
++          <AddNozzleForm dispenserId={dispenser.id} nextNozzleNumber={nextNozzleNumber} />
++        ) : null}
++      </div>
++    </article>
++  )
++}
+diff --git a/src/components/dispensers/DispenserForm.tsx b/src/components/dispensers/DispenserForm.tsx
+new file mode 100644
+index 0000000..4cf6fb7
+--- /dev/null
++++ b/src/components/dispensers/DispenserForm.tsx
+@@ -0,0 +1,210 @@
++'use client'
++
++import { useState, useTransition } from 'react'
++import { Plus, Trash2, X } from 'lucide-react'
++import { createDispenser } from '@/app/actions/dispenser.actions'
++
++type FuelType = 'PETROL_91' | 'PETROL_95' | 'DIESEL' | 'PREMIUM_DIESEL'
++
++type NozzleRow = {
++  rowId: number
++  nozzleNumber: string
++  fuelType: FuelType
++}
++
++type DispenserFormProps = {
++  branchId: string
++}
++
++const fuelTypeOptions: Array<{ value: FuelType; label: string }> = [
++  { value: 'PETROL_91', label: 'Petrol 91' },
++  { value: 'PETROL_95', label: 'Petrol 95' },
++  { value: 'DIESEL', label: 'Diesel' },
++  { value: 'PREMIUM_DIESEL', label: 'Premium Diesel' },
++]
++
++function getInitialNozzles(): NozzleRow[] {
++  return [{ rowId: 1, nozzleNumber: '1', fuelType: 'PETROL_91' }]
++}
++
++export default function DispenserForm({ branchId }: DispenserFormProps) {
++  const [isOpen, setIsOpen] = useState(false)
++  const [dispenserNumber, setDispenserNumber] = useState('')
++  const [nozzles, setNozzles] = useState<NozzleRow[]>(getInitialNozzles())
++  const [error, setError] = useState<string | null>(null)
++  const [isPending, startTransition] = useTransition()
++
++  function resetForm() {
++    setDispenserNumber('')
++    setNozzles(getInitialNozzles())
++    setError(null)
++  }
++
++  function addNozzleRow() {
++    setNozzles(rows => [
++      ...rows,
++      {
++        rowId: (rows.at(-1)?.rowId ?? 0) + 1,
++        nozzleNumber: String(rows.length + 1),
++        fuelType: 'PETROL_91',
++      },
++    ])
++  }
++
++  function removeNozzleRow(rowId: number) {
++    setNozzles(rows => (rows.length > 1 ? rows.filter(row => row.rowId !== rowId) : rows))
++  }
++
++  function updateNozzleRow(rowId: number, patch: Partial<Omit<NozzleRow, 'rowId'>>) {
++    setNozzles(rows => rows.map(row => (row.rowId === rowId ? { ...row, ...patch } : row)))
++  }
++
++  function handleSubmit() {
++    setError(null)
++
++    const formData = new FormData()
++    formData.set('branchId', branchId)
++    formData.set('dispenserNumber', dispenserNumber)
++    formData.set('nozzleCount', String(nozzles.length))
++    nozzles.forEach((nozzle, index) => {
++      formData.set(`nozzleNumber_${index}`, nozzle.nozzleNumber)
++      formData.set(`fuelType_${index}`, nozzle.fuelType)
++    })
++
++    startTransition(async () => {
++      const result = await createDispenser(formData)
++      if (!result.success) {
++        setError(result.error ?? 'Failed to create dispenser')
++        return
++      }
++      resetForm()
++      setIsOpen(false)
++    })
++  }
++
++  return (
++    <>
++      <button
++        type="button"
++        onClick={() => setIsOpen(true)}
++        className="flex items-center gap-2 rounded-lg bg-amber-500 px-4 py-2 text-sm font-medium text-gray-900 hover:bg-amber-400"
++      >
++        <Plus size={16} />
++        Add Dispenser
++      </button>
++
++      {isOpen ? (
++        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
++          <div className="max-h-[90vh] w-full max-w-lg overflow-y-auto rounded-xl bg-white p-6 shadow-xl">
++            <div className="mb-4 flex items-center justify-between">
++              <h2 className="text-lg font-semibold text-gray-800">Add Dispenser</h2>
++              <button
++                type="button"
++                onClick={() => {
++                  resetForm()
++                  setIsOpen(false)
++                }}
++                className="rounded-lg p-1.5 text-gray-400 hover:bg-gray-100 hover:text-gray-700"
++              >
++                <X size={18} />
++              </button>
++            </div>
++
++            <div className="space-y-4">
++              <div>
++                <label className="mb-1 block text-sm font-medium text-gray-700">
++                  Dispenser number
++                </label>
++                <input
++                  type="number"
++                  min={1}
++                  value={dispenserNumber}
++                  onChange={event => setDispenserNumber(event.target.value)}
++                  className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500"
++                  placeholder="e.g. 1"
++                />
++              </div>
++
++              <div>
++                <div className="mb-2 flex items-center justify-between">
++                  <label className="block text-sm font-medium text-gray-700">Nozzles</label>
++                  <button
++                    type="button"
++                    onClick={addNozzleRow}
++                    className="flex items-center gap-1 text-xs font-medium text-amber-600 hover:text-amber-700"
++                  >
++                    <Plus size={14} />
++                    Add nozzle
++                  </button>
++                </div>
++
++                <div className="space-y-2">
++                  {nozzles.map(nozzle => (
++                    <div key={nozzle.rowId} className="flex items-center gap-2">
++                      <input
++                        type="number"
++                        min={1}
++                        value={nozzle.nozzleNumber}
++                        onChange={event =>
++                          updateNozzleRow(nozzle.rowId, { nozzleNumber: event.target.value })
++                        }
++                        className="w-20 rounded-lg border border-gray-300 px-2 py-2 text-sm focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500"
++                        placeholder="No."
++                      />
++                      <select
++                        value={nozzle.fuelType}
++                        onChange={event =>
++                          updateNozzleRow(nozzle.rowId, {
++                            fuelType: event.target.value as FuelType,
++                          })
++                        }
++                        className="flex-1 rounded-lg border border-gray-300 px-2 py-2 text-sm focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500"
++                      >
++                        {fuelTypeOptions.map(option => (
++                          <option key={option.value} value={option.value}>
++                            {option.label}
++                          </option>
++                        ))}
++                      </select>
++                      <button
++                        type="button"
++                        onClick={() => removeNozzleRow(nozzle.rowId)}
++                        disabled={nozzles.length === 1}
++                        className="rounded-lg p-2 text-gray-400 hover:bg-gray-100 hover:text-red-600 disabled:cursor-not-allowed disabled:opacity-40"
++                      >
++                        <Trash2 size={14} />
++                      </button>
++                    </div>
++                  ))}
++                </div>
++              </div>
++
++              {error ? <p className="text-sm text-red-600">{error}</p> : null}
++
++              <div className="flex justify-end gap-2 pt-2">
++                <button
++                  type="button"
++                  onClick={() => {
++                    resetForm()
++                    setIsOpen(false)
++                  }}
++                  className="rounded-lg px-4 py-2 text-sm font-medium text-gray-600 hover:bg-gray-100"
++                >
++                  Cancel
++                </button>
++                <button
++                  type="button"
++                  onClick={handleSubmit}
++                  disabled={isPending}
++                  className="rounded-lg bg-amber-500 px-4 py-2 text-sm font-medium text-gray-900 hover:bg-amber-400 disabled:opacity-60"
++                >
++                  {isPending ? 'Creating…' : 'Create Dispenser'}
++                </button>
++              </div>
++            </div>
++          </div>
++        </div>
++      ) : null}
++    </>
++  )
++}
+diff --git a/src/components/dispensers/DispenserStatusButton.tsx b/src/components/dispensers/DispenserStatusButton.tsx
+new file mode 100644
+index 0000000..9bb785a
+--- /dev/null
++++ b/src/components/dispensers/DispenserStatusButton.tsx
+@@ -0,0 +1,74 @@
++'use client'
++
++import { useState, useTransition } from 'react'
++import { ChevronDown } from 'lucide-react'
++import { updateDispenserStatus } from '@/app/actions/dispenser.actions'
++
++type DispenserStatus = 'IDLE' | 'ACTIVE' | 'MAINTENANCE' | 'OFFLINE'
++
++type DispenserStatusButtonProps = {
++  dispenserId: string
++  currentStatus: DispenserStatus
++}
++
++const statusConfig: Record<DispenserStatus, { label: string; color: string }> = {
++  ACTIVE: { label: 'Active', color: 'bg-green-100 text-green-700' },
++  IDLE: { label: 'Idle', color: 'bg-gray-100 text-gray-600' },
++  MAINTENANCE: { label: 'Maintenance', color: 'bg-amber-100 text-amber-700' },
++  OFFLINE: { label: 'Offline', color: 'bg-red-100 text-red-600' },
++}
++
++export default function DispenserStatusButton({
++  dispenserId,
++  currentStatus,
++}: DispenserStatusButtonProps) {
++  const [open, setOpen] = useState(false)
++  const [error, setError] = useState<string | null>(null)
++  const [isPending, startTransition] = useTransition()
++
++  function handleStatusChange(newStatus: DispenserStatus) {
++    setOpen(false)
++    setError(null)
++    startTransition(async () => {
++      const result = await updateDispenserStatus(dispenserId, newStatus)
++      if (!result.success) {
++        setError(result.error ?? 'Failed to update status')
++      }
++    })
++  }
++
++  const config = statusConfig[currentStatus]
++
++  return (
++    <div className="relative">
++      <button
++        type="button"
++        onClick={() => setOpen(value => !value)}
++        disabled={isPending}
++        className={`flex items-center gap-1 rounded-full px-2.5 py-1 text-xs font-semibold disabled:opacity-60 ${config.color}`}
++      >
++        {config.label}
++        <ChevronDown size={12} />
++      </button>
++
++      {open ? (
++        <div className="absolute right-0 z-10 mt-1 w-36 rounded-lg border border-gray-200 bg-white py-1 shadow-lg">
++          {(Object.keys(statusConfig) as DispenserStatus[]).map(status => (
++            <button
++              key={status}
++              type="button"
++              onClick={() => handleStatusChange(status)}
++              className={`block w-full px-3 py-1.5 text-left text-xs hover:bg-gray-50 ${
++                status === currentStatus ? 'font-semibold text-gray-800' : 'text-gray-600'
++              }`}
++            >
++              {statusConfig[status].label}
++            </button>
++          ))}
++        </div>
++      ) : null}
++
++      {error ? <p className="mt-1 text-xs text-red-500">{error}</p> : null}
++    </div>
++  )
++}
+diff --git a/src/components/dispensers/PumpCard.tsx b/src/components/dispensers/PumpCard.tsx
+deleted file mode 100644
+index 4a9b4af..0000000
+--- a/src/components/dispensers/PumpCard.tsx
++++ /dev/null
+@@ -1,152 +0,0 @@
+-import { Fuel } from 'lucide-react'
+-import PumpStatusButton from './PumpStatusButton'
+-import PumpReadingInput from './PumpReadingInput'
+-import type { Prisma } from '../../../prisma/generated/client'
+-
+-type PumpWithNozzles =
+-  Prisma.DispenserGetPayload<{
+-    include: {
+-      nozzles: true
+-    }
+-  }>
+-
+-type PumpCardProps = {
+-  pump: PumpWithNozzles
+-}
+-
+-const fuelLabels: Record<
+-  string,
+-  {
+-    label: string
+-    color: string
+-  }
+-> = {
+-  PETROL_91: {
+-    label: 'Petrol 91',
+-    color: 'bg-blue-100 text-blue-700',
+-  },
+-  PETROL_95: {
+-    label: 'Petrol 95',
+-    color: 'bg-indigo-100 text-indigo-700',
+-  },
+-  DIESEL: {
+-    label: 'Diesel',
+-    color: 'bg-yellow-100 text-yellow-700',
+-  },
+-  PREMIUM_DIESEL: {
+-    label: 'Premium Diesel',
+-    color: 'bg-orange-100 text-orange-700',
+-  },
+-}
+-
+-const borderColor: Record<string, string> = {
+-  ACTIVE: 'border-l-green-500',
+-  IDLE: 'border-l-gray-300',
+-  MAINTENANCE: 'border-l-amber-500',
+-  OFFLINE: 'border-l-red-500',
+-}
+-
+-export default function PumpCard({
+-  pump,
+-}: PumpCardProps) {
+-  const statusBorder =
+-    borderColor[pump.status] ??
+-    borderColor.IDLE
+-
+-  return (
+-    <article
+-      className={`flex flex-col gap-4 rounded-xl border border-l-4 border-gray-200 bg-white p-5 ${statusBorder}`}
+-    >
+-      {/* Dispenser header */}
+-      <div className="flex items-start justify-between gap-4">
+-        <div className="flex items-center gap-3">
+-          <div className="rounded-lg bg-gray-100 p-2.5">
+-            <Fuel
+-              size={20}
+-              className="text-gray-600"
+-            />
+-          </div>
+-
+-          <div>
+-            <p className="text-xs font-medium uppercase tracking-wide text-gray-400">
+-              Dispenser
+-            </p>
+-
+-            <h2 className="text-lg font-bold text-gray-800">
+-              #{pump.dispenserNumber}
+-            </h2>
+-
+-            <p className="mt-0.5 text-xs text-gray-500">
+-              {pump.nozzles.length}{' '}
+-              {pump.nozzles.length === 1
+-                ? 'nozzle'
+-                : 'nozzles'}
+-            </p>
+-          </div>
+-        </div>
+-
+-        <PumpStatusButton
+-          pumpId={pump.id}
+-          currentStatus={pump.status}
+-        />
+-      </div>
+-
+-      {/* Nozzles */}
+-      <div className="space-y-3 border-t border-gray-100 pt-4">
+-        {pump.nozzles.length === 0 ? (
+-          <div className="rounded-lg border border-dashed border-gray-300 px-4 py-5 text-center">
+-            <p className="text-sm text-gray-500">
+-              No nozzles configured for this
+-              dispenser.
+-            </p>
+-          </div>
+-        ) : (
+-          pump.nozzles.map(nozzle => {
+-            const fuel =
+-              fuelLabels[nozzle.fuelType] ?? {
+-                label: nozzle.fuelType,
+-                color:
+-                  'bg-gray-100 text-gray-600',
+-              }
+-
+-            const reading = Number(
+-              nozzle.currentReading,
+-            )
+-
+-            return (
+-              <div
+-                key={nozzle.id}
+-                className="rounded-lg border border-gray-200 bg-gray-50 p-3"
+-              >
+-                <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+-                  <div>
+-                    <div className="flex items-center gap-2">
+-                      <p className="text-sm font-semibold text-gray-800">
+-                        Nozzle #{nozzle.nozzleNumber}
+-                      </p>
+-
+-                      <span
+-                        className={`rounded-full px-2 py-0.5 text-xs font-medium ${fuel.color}`}
+-                      >
+-                        {fuel.label}
+-                      </span>
+-                    </div>
+-
+-                    <p className="mt-1 text-xs text-gray-400">
+-                      Cumulative totalizer reading
+-                    </p>
+-                  </div>
+-
+-                  <PumpReadingInput
+-                    nozzleId={nozzle.id}
+-                    reading={reading}
+-                  />
+-                </div>
+-              </div>
+-            )
+-          })
+-        )}
+-      </div>
+-    </article>
+-  )
+-}
+\ No newline at end of file
+diff --git a/src/components/dispensers/PumpReadingInput.tsx b/src/components/dispensers/PumpReadingInput.tsx
+deleted file mode 100644
+index 4c15f25..0000000
+--- a/src/components/dispensers/PumpReadingInput.tsx
++++ /dev/null
+@@ -1,77 +0,0 @@
+-'use client'
+-
+-import { useState, useTransition } from 'react'
+-import { updateNozzleReading } from '@/app/actions/pump.actions'
+-import { Pencil, Check, X } from 'lucide-react'
+-
+-interface Props {
+-  nozzleId: string
+-  reading: number
+-}
+-
+-export default function PumpReadingInput({ nozzleId, reading }: Props) {
+-  const [editing, setEditing] = useState(false)
+-  const [value, setValue] = useState(reading.toString())
+-  const [isPending, startTransition] = useTransition()
+-
+-  function handleSave() {
+-    const num = parseFloat(value)
+-    if (isNaN(num) || num < 0) return
+-
+-    startTransition(async () => {
+-      await updateNozzleReading(nozzleId, num)
+-      setEditing(false)
+-    })
+-  }
+-
+-  function handleCancel() {
+-    setValue(reading.toString())
+-    setEditing(false)
+-  }
+-
+-  if (!editing) {
+-    return (
+-      <div className="flex items-center gap-2">
+-        <span className="text-sm font-mono text-gray-700">
+-          {Number(reading).toLocaleString()} L
+-        </span>
+-        <button
+-          onClick={() => setEditing(true)}
+-          className="text-gray-400 hover:text-gray-600 transition-colors"
+-        >
+-          <Pencil size={13} />
+-        </button>
+-      </div>
+-    )
+-  }
+-
+-  return (
+-    <div className="flex items-center gap-1">
+-      <input
+-        type="number"
+-        value={value}
+-        onChange={e => setValue(e.target.value)}
+-        className="w-24 px-2 py-1 text-sm border border-amber-400 rounded-md
+-          focus:outline-none focus:ring-2 focus:ring-amber-500 font-mono"
+-        autoFocus
+-        onKeyDown={e => {
+-          if (e.key === 'Enter') handleSave()
+-          if (e.key === 'Escape') handleCancel()
+-        }}
+-      />
+-      <button
+-        onClick={handleSave}
+-        disabled={isPending}
+-        className="text-green-600 hover:text-green-700 transition-colors"
+-      >
+-        <Check size={15} />
+-      </button>
+-      <button
+-        onClick={handleCancel}
+-        className="text-red-400 hover:text-red-600 transition-colors"
+-      >
+-        <X size={15} />
+-      </button>
+-    </div>
+-  )
+-}
+\ No newline at end of file
+diff --git a/src/components/dispensers/PumpStatusButton.tsx b/src/components/dispensers/PumpStatusButton.tsx
+deleted file mode 100644
+index c086977..0000000
+--- a/src/components/dispensers/PumpStatusButton.tsx
++++ /dev/null
+@@ -1,80 +0,0 @@
+-'use client'
+-
+-import { useState, useTransition } from 'react'
+-import { updatePumpStatus } from '@/app/actions/pump.actions'
+-import { ChevronDown } from 'lucide-react'
+-
+-type PumpStatus = 'IDLE' | 'ACTIVE' | 'MAINTENANCE' | 'OFFLINE'
+-
+-interface Props {
+-  pumpId:        string
+-  currentStatus: PumpStatus
+-}
+-
+-const statusConfig: Record<PumpStatus, { label: string; color: string }> = {
+-  ACTIVE:      { label: 'Active',      color: 'bg-green-100 text-green-700' },
+-  IDLE:        { label: 'Idle',        color: 'bg-gray-100  text-gray-600'  },
+-  MAINTENANCE: { label: 'Maintenance', color: 'bg-amber-100 text-amber-700' },
+-  OFFLINE:     { label: 'Offline',     color: 'bg-red-100   text-red-600'   },
+-}
+-
+-export default function PumpStatusButton({ pumpId, currentStatus }: Props) {
+-  const [open, setOpen]           = useState(false)
+-  const [isPending, startTransition] = useTransition()
+-
+-  // useTransition — keeps UI responsive while Server Action runs
+-  function handleStatusChange(newStatus: PumpStatus) {
+-    setOpen(false)
+-    startTransition(async () => {
+-      await updatePumpStatus(pumpId, newStatus)
+-    })
+-  }
+-
+-  const current = statusConfig[currentStatus]
+-
+-  return (
+-    <div className="relative">
+-      <button
+-        onClick={() => setOpen(!open)}
+-        disabled={isPending}
+-        className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium
+-          transition-opacity ${isPending ? 'opacity-50' : ''}
+-          ${current.color}`}
+-      >
+-        {isPending ? 'Updating…' : current.label}
+-        <ChevronDown size={12} />
+-      </button>
+-
+-      {/* Dropdown */}
+-      {open && (
+-        <>
+-          {/* Backdrop to close */}
+-          <div
+-            className="fixed inset-0 z-10"
+-            onClick={() => setOpen(false)}
+-          />
+-          <div className="absolute top-8 left-0 z-20 bg-white rounded-lg shadow-lg
+-            border border-gray-200 py-1 min-w-32.5">
+-            {(Object.keys(statusConfig) as PumpStatus[]).map((status) => (
+-              <button
+-                key={status}
+-                onClick={() => handleStatusChange(status)}
+-                className={`w-full text-left px-3 py-2 text-xs hover:bg-gray-50
+-                  flex items-center gap-2
+-                  ${status === currentStatus ? 'font-medium' : ''}`}
+-              >
+-                <span className={`w-2 h-2 rounded-full ${
+-                  status === 'ACTIVE'      ? 'bg-green-500' :
+-                  status === 'IDLE'        ? 'bg-gray-400'  :
+-                  status === 'MAINTENANCE' ? 'bg-amber-500' :
+-                                             'bg-red-500'
+-                }`} />
+-                {statusConfig[status].label}
+-              </button>
+-            ))}
+-          </div>
+-        </>
+-      )}
+-    </div>
+-  )
+-}
+\ No newline at end of file
+diff --git a/src/components/fuel/TankCard.tsx b/src/components/fuel/TankCard.tsx
+index e8cf2d1..ee1c85c 100644
+--- a/src/components/fuel/TankCard.tsx
++++ b/src/components/fuel/TankCard.tsx
+@@ -1,117 +1,88 @@
+ import TankLevelGauge from './TankLevelGauge'
+-import { AlertTriangle } from 'lucide-react'
++import TankForm from '@/components/tanks/TankForm'
++import ActiveToggle from '@/components/shared/ActiveToggle'
++import { setTankActive } from '@/app/actions/tank.actions'
++import type { FuelTank } from '../../../prisma/generated/client'
+ 
+-interface Tank {
+-  id:           string
+-  tankNumber:   number
+-  fuelType:     string
+-  capacity:     number | any
+-  currentLevel: number | any
+-  minLevel:     number | any
++type TankCardProps = {
++  tank: FuelTank
++  canManage: boolean
+ }
+ 
+ const fuelLabels: Record<string, { label: string; color: string }> = {
+-  PETROL_91:      { label: 'Petrol 91',      color: 'bg-blue-100   text-blue-700'   },
+-  PETROL_95:      { label: 'Petrol 95',      color: 'bg-indigo-100 text-indigo-700' },
+-  DIESEL:         { label: 'Diesel',         color: 'bg-yellow-100 text-yellow-700' },
++  PETROL_91: { label: 'Petrol 91', color: 'bg-blue-100 text-blue-700' },
++  PETROL_95: { label: 'Petrol 95', color: 'bg-indigo-100 text-indigo-700' },
++  DIESEL: { label: 'Diesel', color: 'bg-yellow-100 text-yellow-700' },
+   PREMIUM_DIESEL: { label: 'Premium Diesel', color: 'bg-orange-100 text-orange-700' },
+ }
+ 
+-export default function TankCard({ tank }: { tank: Tank }) {
+-  const capacity     = Number(tank.capacity)
++export default function TankCard({ tank, canManage }: TankCardProps) {
++  const capacity = Number(tank.capacity)
+   const currentLevel = Number(tank.currentLevel)
+-  const minLevel     = Number(tank.minLevel)
+-  const percentage   = Math.round((currentLevel / capacity) * 100)
+-  const isLow        = currentLevel <= minLevel * 1.5   // within 150% of min
+-  const isCritical   = currentLevel <= minLevel         // at or below min
+-  const available    = capacity - currentLevel          // space remaining
++  const minLevel = Number(tank.minLevel)
++  const percentage = capacity > 0 ? (currentLevel / capacity) * 100 : 0
++  const isCritical = currentLevel <= minLevel
++  const isLow = !isCritical && currentLevel <= minLevel * 1.5
+ 
+   const fuel = fuelLabels[tank.fuelType] ?? {
+     label: tank.fuelType,
+-    color: 'bg-gray-100 text-gray-600'
++    color: 'bg-gray-100 text-gray-600',
+   }
+ 
+   return (
+-    <div className={`bg-white rounded-xl border p-5
+-      ${isCritical
+-        ? 'border-red-300 ring-1 ring-red-200'
+-        : isLow
+-        ? 'border-amber-300'
+-        : 'border-gray-200'}`}>
++    <article
++      className={`flex items-center gap-4 rounded-xl border border-gray-200 bg-white p-5 ${
++        tank.isActive ? '' : 'opacity-60'
++      }`}
++    >
++      <TankLevelGauge percentage={percentage} isLow={isLow} isCritical={isCritical} />
+ 
+-      {/* Header */}
+-      <div className="flex items-start justify-between mb-4">
+-        <div>
+-          <p className="text-lg font-bold text-gray-800">
+-            Tank #{tank.tankNumber}
+-          </p>
+-          <span className={`text-xs font-medium px-2 py-0.5
+-            rounded-full ${fuel.color}`}>
+-            {fuel.label}
+-          </span>
++      <div className="min-w-0 flex-1">
++        <div className="flex items-start justify-between gap-2">
++          <div>
++            <p className="text-xs font-medium uppercase tracking-wide text-gray-400">Tank</p>
++            <h2 className="text-lg font-bold text-gray-800">#{tank.tankNumber}</h2>
++          </div>
++
++          {canManage ? (
++            <div className="flex items-center gap-1">
++              <TankForm
++                mode="edit"
++                branchId={tank.branchId}
++                tank={{
++                  id: tank.id,
++                  tankNumber: String(tank.tankNumber),
++                  fuelType: tank.fuelType,
++                  capacity: String(capacity),
++                  currentLevel: String(currentLevel),
++                  minLevel: String(minLevel),
++                }}
++              />
++              <ActiveToggle
++                id={tank.id}
++                isActive={tank.isActive}
++                action={setTankActive}
++                confirmDisableMessage="Decommission this tank? It will be hidden from active use but delivery history is preserved."
++              />
++            </div>
++          ) : null}
+         </div>
+ 
+-        {/* Alert badge */}
+-        {isCritical && (
+-          <div className="flex items-center gap-1.5 bg-red-100 text-red-700
+-            px-2.5 py-1 rounded-full text-xs font-medium">
+-            <AlertTriangle size={12} />
+-            Critical
+-          </div>
+-        )}
+-        {isLow && !isCritical && (
+-          <div className="flex items-center gap-1.5 bg-amber-100 text-amber-700
+-            px-2.5 py-1 rounded-full text-xs font-medium">
+-            <AlertTriangle size={12} />
+-            Low
+-          </div>
+-        )}
+-      </div>
++        <span className={`mt-1 inline-block rounded-full px-2 py-0.5 text-xs font-medium ${fuel.color}`}>
++          {fuel.label}
++        </span>
+ 
+-      {/* Gauge + stats side by side */}
+-      <div className="flex items-center gap-4">
+-        <TankLevelGauge
+-          percentage={percentage}
+-          isLow={isLow}
+-          isCritical={isCritical}
+-        />
++        <p className="mt-2 text-sm text-gray-600">
++          {currentLevel.toLocaleString()} / {capacity.toLocaleString()} L
++        </p>
++        <p className="text-xs text-gray-400">Alert threshold: {minLevel.toLocaleString()} L</p>
+ 
+-        {/* Stats */}
+-        <div className="flex-1 space-y-2.5">
+-          <div className="flex justify-between text-sm">
+-            <span className="text-gray-400">Current</span>
+-            <span className="font-medium text-gray-700">
+-              {currentLevel.toLocaleString()} L
+-            </span>
+-          </div>
+-          <div className="flex justify-between text-sm">
+-            <span className="text-gray-400">Capacity</span>
+-            <span className="font-medium text-gray-700">
+-              {capacity.toLocaleString()} L
+-            </span>
+-          </div>
+-          <div className="flex justify-between text-sm">
+-            <span className="text-gray-400">Available</span>
+-            <span className="font-medium text-gray-700">
+-              {available.toLocaleString()} L
+-            </span>
+-          </div>
+-          <div className="flex justify-between text-sm">
+-            <span className="text-gray-400">Min. level</span>
+-            <span className={`font-medium ${isCritical ? 'text-red-600' : 'text-gray-700'}`}>
+-              {minLevel.toLocaleString()} L
+-            </span>
+-          </div>
+-        </div>
++        {!tank.isActive ? (
++          <span className="mt-2 inline-block rounded-full bg-gray-200 px-2 py-0.5 text-xs font-medium text-gray-500">
++            Decommissioned
++          </span>
++        ) : null}
+       </div>
+-
+-      {/* Alert bar at bottom when critical */}
+-      {isCritical && (
+-        <div className="mt-4 bg-red-50 border border-red-200 rounded-lg
+-          px-3 py-2 text-xs text-red-700">
+-          Tank is at or below minimum level. Order a delivery immediately.
+-        </div>
+-      )}
+-    </div>
++    </article>
+   )
+-}
+\ No newline at end of file
++}
+diff --git a/src/components/shared/ActiveToggle.tsx b/src/components/shared/ActiveToggle.tsx
+new file mode 100644
+index 0000000..dc26f86
+--- /dev/null
++++ b/src/components/shared/ActiveToggle.tsx
+@@ -0,0 +1,57 @@
++'use client'
++
++import { useState, useTransition } from 'react'
++import { Ban, CheckCircle2 } from 'lucide-react'
++
++type ActionResult = { success: boolean; error?: string }
++
++type ActiveToggleProps = {
++  id: string
++  isActive: boolean
++  action: (id: string, nextValue: boolean) => Promise<ActionResult>
++  confirmDisableMessage: string
++  size?: number
++}
++
++export default function ActiveToggle({
++  id,
++  isActive,
++  action,
++  confirmDisableMessage,
++  size = 16,
++}: ActiveToggleProps) {
++  const [isPending, startTransition] = useTransition()
++  const [error, setError] = useState<string | null>(null)
++
++  function handleToggle() {
++    setError(null)
++    const nextValue = !isActive
++
++    const confirmed = nextValue ? true : window.confirm(confirmDisableMessage)
++    if (!confirmed) return
++
++    startTransition(async () => {
++      const result = await action(id, nextValue)
++      if (!result.success) {
++        setError(result.error ?? 'Failed to update status')
++      }
++    })
++  }
++
++  return (
++    <div className="flex flex-col items-end">
++      <button
++        type="button"
++        onClick={handleToggle}
++        disabled={isPending}
++        title={isActive ? 'Decommission' : 'Restore'}
++        className={`rounded-lg p-2 hover:bg-gray-100 disabled:opacity-60 ${
++          isActive ? 'text-gray-400 hover:text-red-600' : 'text-gray-400 hover:text-green-600'
++        }`}
++      >
++        {isActive ? <Ban size={size} /> : <CheckCircle2 size={size} />}
++      </button>
++      {error ? <span className="mt-0.5 text-xs text-red-500">{error}</span> : null}
++    </div>
++  )
++}
+diff --git a/src/components/tanks/TankForm.tsx b/src/components/tanks/TankForm.tsx
+new file mode 100644
+index 0000000..3ee2b28
+--- /dev/null
++++ b/src/components/tanks/TankForm.tsx
+@@ -0,0 +1,214 @@
++'use client'
++
++import { useState, useTransition } from 'react'
++import { Plus, X, Pencil } from 'lucide-react'
++import { createTank, updateTank } from '@/app/actions/tank.actions'
++
++type FuelType = 'PETROL_91' | 'PETROL_95' | 'DIESEL' | 'PREMIUM_DIESEL'
++
++export type TankFormValues = {
++  id: string
++  tankNumber: string
++  fuelType: FuelType
++  capacity: string
++  currentLevel: string
++  minLevel: string
++}
++
++type TankFormProps = {
++  mode: 'create' | 'edit'
++  branchId: string
++  tank?: TankFormValues
++}
++
++const fuelTypeOptions: Array<{ value: FuelType; label: string }> = [
++  { value: 'PETROL_91', label: 'Petrol 91' },
++  { value: 'PETROL_95', label: 'Petrol 95' },
++  { value: 'DIESEL', label: 'Diesel' },
++  { value: 'PREMIUM_DIESEL', label: 'Premium Diesel' },
++]
++
++const emptyValues: Omit<TankFormValues, 'id'> = {
++  tankNumber: '',
++  fuelType: 'PETROL_91',
++  capacity: '',
++  currentLevel: '',
++  minLevel: '',
++}
++
++export default function TankForm({ mode, branchId, tank }: TankFormProps) {
++  const [isOpen, setIsOpen] = useState(false)
++  const [values, setValues] = useState<TankFormValues>(tank ?? { id: '', ...emptyValues })
++  const [error, setError] = useState<string | null>(null)
++  const [isPending, startTransition] = useTransition()
++
++  function patch(update: Partial<TankFormValues>) {
++    setValues(current => ({ ...current, ...update }))
++  }
++
++  function handleSubmit() {
++    setError(null)
++
++    const formData = new FormData()
++    formData.set('branchId', branchId)
++    formData.set('tankNumber', values.tankNumber)
++    formData.set('fuelType', values.fuelType)
++    formData.set('capacity', values.capacity)
++    formData.set('currentLevel', values.currentLevel)
++    formData.set('minLevel', values.minLevel)
++
++    startTransition(async () => {
++      const result =
++        mode === 'create' ? await createTank(formData) : await updateTank(values.id, formData)
++
++      if (!result.success) {
++        setError(result.error ?? 'Something went wrong')
++        return
++      }
++
++      setIsOpen(false)
++    })
++  }
++
++  return (
++    <>
++      {mode === 'create' ? (
++        <button
++          type="button"
++          onClick={() => setIsOpen(true)}
++          className="flex items-center gap-2 rounded-lg bg-amber-500 px-4 py-2 text-sm font-medium text-gray-900 hover:bg-amber-400"
++        >
++          <Plus size={16} />
++          Add Tank
++        </button>
++      ) : (
++        <button
++          type="button"
++          onClick={() => setIsOpen(true)}
++          className="rounded-lg p-2 text-gray-400 hover:bg-gray-100 hover:text-gray-700"
++          title="Edit tank"
++        >
++          <Pencil size={16} />
++        </button>
++      )}
++
++      {isOpen ? (
++        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
++          <div className="w-full max-w-md rounded-xl bg-white p-6 shadow-xl">
++            <div className="mb-4 flex items-center justify-between">
++              <h2 className="text-lg font-semibold text-gray-800">
++                {mode === 'create' ? 'Add Tank' : 'Edit Tank'}
++              </h2>
++              <button
++                type="button"
++                onClick={() => setIsOpen(false)}
++                className="rounded-lg p-1.5 text-gray-400 hover:bg-gray-100 hover:text-gray-700"
++              >
++                <X size={18} />
++              </button>
++            </div>
++
++            <div className="space-y-4">
++              <div className="grid grid-cols-2 gap-3">
++                <div>
++                  <label className="mb-1 block text-sm font-medium text-gray-700">
++                    Tank number
++                  </label>
++                  <input
++                    type="number"
++                    min={1}
++                    value={values.tankNumber}
++                    onChange={event => patch({ tankNumber: event.target.value })}
++                    className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500"
++                  />
++                </div>
++                <div>
++                  <label className="mb-1 block text-sm font-medium text-gray-700">
++                    Fuel type
++                  </label>
++                  <select
++                    value={values.fuelType}
++                    onChange={event => patch({ fuelType: event.target.value as FuelType })}
++                    className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500"
++                  >
++                    {fuelTypeOptions.map(option => (
++                      <option key={option.value} value={option.value}>
++                        {option.label}
++                      </option>
++                    ))}
++                  </select>
++                </div>
++              </div>
++
++              <div>
++                <label className="mb-1 block text-sm font-medium text-gray-700">
++                  Capacity (litres)
++                </label>
++                <input
++                  type="number"
++                  min={0}
++                  step="0.001"
++                  value={values.capacity}
++                  onChange={event => patch({ capacity: event.target.value })}
++                  className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500"
++                />
++              </div>
++
++              <div className="grid grid-cols-2 gap-3">
++                <div>
++                  <label className="mb-1 block text-sm font-medium text-gray-700">
++                    Current level (litres)
++                  </label>
++                  <input
++                    type="number"
++                    min={0}
++                    step="0.001"
++                    value={values.currentLevel}
++                    onChange={event => patch({ currentLevel: event.target.value })}
++                    className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500"
++                  />
++                  <p className="mt-1 text-xs text-gray-400">
++                    Manual override. Deliveries will adjust this automatically in a later phase.
++                  </p>
++                </div>
++                <div>
++                  <label className="mb-1 block text-sm font-medium text-gray-700">
++                    Min. alert level (litres)
++                  </label>
++                  <input
++                    type="number"
++                    min={0}
++                    step="0.001"
++                    value={values.minLevel}
++                    onChange={event => patch({ minLevel: event.target.value })}
++                    className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500"
++                  />
++                </div>
++              </div>
++
++              {error ? <p className="text-sm text-red-600">{error}</p> : null}
++
++              <div className="flex justify-end gap-2 pt-2">
++                <button
++                  type="button"
++                  onClick={() => setIsOpen(false)}
++                  className="rounded-lg px-4 py-2 text-sm font-medium text-gray-600 hover:bg-gray-100"
++                >
++                  Cancel
++                </button>
++                <button
++                  type="button"
++                  onClick={handleSubmit}
++                  disabled={isPending}
++                  className="rounded-lg bg-amber-500 px-4 py-2 text-sm font-medium text-gray-900 hover:bg-amber-400 disabled:opacity-60"
++                >
++                  {isPending ? 'Saving…' : mode === 'create' ? 'Create Tank' : 'Save Changes'}
++                </button>
++              </div>
++            </div>
++          </div>
++        </div>
++      ) : null}
++    </>
++  )
++}
+diff --git a/src/lib/validation/equipment.schema.ts b/src/lib/validation/equipment.schema.ts
+new file mode 100644
+index 0000000..0850b53
+--- /dev/null
++++ b/src/lib/validation/equipment.schema.ts
+@@ -0,0 +1,72 @@
++import { z } from 'zod'
++
++// Kept as a plain tuple (not imported from the Prisma enum) so this module
++// has no dependency on the generated Prisma client — validation should be
++// usable anywhere without pulling in the DB client.
++export const FUEL_TYPE_VALUES = [
++  'PETROL_91',
++  'PETROL_95',
++  'DIESEL',
++  'PREMIUM_DIESEL',
++] as const
++
++export type FuelTypeValue = (typeof FUEL_TYPE_VALUES)[number]
++
++// ─── Fuel Tank ──────────────────────────────────────────────
++export const tankInputSchema = z
++  .object({
++    branchId: z.string().min(1, 'Branch is required'),
++    tankNumber: z.coerce
++      .number()
++      .int('Tank number must be a whole number')
++      .positive('Tank number must be a positive integer'),
++    fuelType: z.enum(FUEL_TYPE_VALUES),
++    capacity: z.coerce.number().positive('Capacity must be greater than zero'),
++    currentLevel: z.coerce.number().min(0, 'Current level cannot be negative'),
++    minLevel: z.coerce.number().min(0, 'Minimum level cannot be negative'),
++  })
++  .refine(data => data.currentLevel <= data.capacity, {
++    message: 'Current level cannot exceed tank capacity',
++    path: ['currentLevel'],
++  })
++  .refine(data => data.minLevel <= data.capacity, {
++    message: 'Minimum alert level cannot exceed tank capacity',
++    path: ['minLevel'],
++  })
++
++export type TankInput = z.infer<typeof tankInputSchema>
++
++// ─── Nozzle ─────────────────────────────────────────────────
++export const nozzleInputSchema = z.object({
++  nozzleNumber: z.coerce
++    .number()
++    .int('Nozzle number must be a whole number')
++    .positive('Nozzle number must be a positive integer'),
++  fuelType: z.enum(FUEL_TYPE_VALUES),
++})
++
++export type NozzleInput = z.infer<typeof nozzleInputSchema>
++
++// ─── Dispenser (with its initial nozzles) ──────────────────
++export const dispenserInputSchema = z.object({
++  branchId: z.string().min(1, 'Branch is required'),
++  dispenserNumber: z.coerce
++    .number()
++    .int('Dispenser number must be a whole number')
++    .positive('Dispenser number must be a positive integer'),
++  nozzles: z
++    .array(nozzleInputSchema)
++    .min(1, 'A dispenser needs at least one nozzle')
++    .max(12, 'A dispenser cannot have more than 12 nozzles')
++    .refine(
++      nozzles => new Set(nozzles.map(nozzle => nozzle.nozzleNumber)).size === nozzles.length,
++      { message: 'Nozzle numbers must be unique within a dispenser' },
++    ),
++})
++
++export type DispenserInput = z.infer<typeof dispenserInputSchema>
++
++// ─── Shared helper: first readable message from a ZodError ─
++export function firstZodMessage(error: z.ZodError): string {
++  return error.issues[0]?.message ?? 'Invalid input'
++}
+-- 
+2.43.0
+
