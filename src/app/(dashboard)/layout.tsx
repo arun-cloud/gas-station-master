@@ -1,6 +1,7 @@
 import Sidebar from '@/components/layout/Sidebar'
 import Topbar from '@/components/layout/Topbar'
 import { requireUser } from '@/lib/rbac'
+import { resolveActiveBranch } from '@/lib/branch-context'
 
 export default async function DashboardLayout({
   children,
@@ -12,6 +13,10 @@ export default async function DashboardLayout({
   // name/role/branch context to render.
   const user = await requireUser()
 
+  // Resolved fresh on every request from the session + cookie — see
+  // branch-context.ts for why this is safe against a tampered cookie.
+  const { branches, activeBranchId } = await resolveActiveBranch()
+
   return (
     <div className="flex h-screen bg-gray-50 overflow-hidden">
       {/* Sidebar — fixed left column */}
@@ -19,7 +24,7 @@ export default async function DashboardLayout({
 
       {/* Main area — takes remaining width */}
       <div className="flex flex-col flex-1 overflow-hidden">
-        <Topbar />
+        <Topbar branches={branches} activeBranchId={activeBranchId} />
 
         {/* Scrollable content */}
         <main className="flex-1 overflow-y-auto p-6">

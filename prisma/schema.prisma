@@ -102,8 +102,16 @@ model Branch {
   userBranches UserBranch[]
   shifts       Shift[]
 
+  isActive Boolean @default(true)
+
+  // Audit: who created/last modified this branch (nullable — seed data has no actor)
+  createdBy String?
+  updatedBy String?
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+
+  @@index([isActive])
 }
 
 // ─── Dispensers ─────────────────────────────────────────────

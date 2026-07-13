@@ -16,6 +16,7 @@ import {
   Plus,
   Clock,
   ShieldCheck,
+  Building2,
   LogOut,
 } from 'lucide-react'
 
@@ -49,12 +50,18 @@ export default function Sidebar({ user }: { user: SidebarUser }) {
   const pathname = usePathname()
 
   const items =
-    user.role === 'ADMIN' || user.role === 'MANAGER'
+    user.role === 'ADMIN'
       ? [
           ...navItems,
           { label: 'User Approvals', href: '/admin/users', icon: ShieldCheck },
+          { label: 'Branches', href: '/admin/branches', icon: Building2 },
         ]
-      : navItems
+      : user.role === 'MANAGER'
+        ? [
+            ...navItems,
+            { label: 'User Approvals', href: '/admin/users', icon: ShieldCheck },
+          ]
+        : navItems
 
   return (
     <aside className="w-60 bg-gray-900 text-white flex flex-col h-full shrink-0">

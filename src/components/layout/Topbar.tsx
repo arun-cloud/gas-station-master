@@ -2,33 +2,51 @@
 
 import { usePathname } from 'next/navigation'
 import { Bell, Search } from 'lucide-react'
+import BranchSwitcher from '@/components/branches/BranchSwitcher'
 
-// Map routes to readable page titles
-const pageTitles: Record<string, string> = {
-  '/dashboard':  'Dashboard',
-  '/pumps':      'Pump Management',
-  '/fuel':       'Fuel Inventory',
-  '/sales':      'Sales',
-  '/employees':  'Employees',
-  '/suppliers':  'Suppliers',
-  '/reports':    'Reports',
-  '/settings':   'Settings',
+type TopbarBranch = {
+  id: string
+  nameEn: string
+  branchCode: string
 }
 
-export default function Topbar() {
-  const pathname  = usePathname()
+type TopbarProps = {
+  branches: TopbarBranch[]
+  activeBranchId: string | null
+}
+
+// Map routes to readable page titles.
+// NOTE: keys were previously out of sync with the actual App Router routes
+// (e.g. '/pumps' vs. the real '/dispensers' route) — fixed here.
+const pageTitles: Record<string, string> = {
+  '/dashboard': 'Dashboard',
+  '/dispensers': 'Dispensers Management',
+  '/fuel': 'Fuel Inventory',
+  '/sales': 'Sales',
+  '/sales/new': 'New Sale',
+  '/employees': 'Employees',
+  '/employees/shifts': 'Shift History',
+  '/suppliers': 'Suppliers',
+  '/reports': 'Reports',
+  '/settings': 'Settings',
+  '/admin/users': 'User Approvals',
+  '/admin/branches': 'Branches',
+}
+
+export default function Topbar({ branches, activeBranchId }: TopbarProps) {
+  const pathname = usePathname()
   const pageTitle = pageTitles[pathname] ?? 'Gas Station MS'
 
   return (
     <header className="h-16 bg-white border-b border-gray-200 flex items-center justify-between px-6 shrink-0">
-
       {/* Page title */}
-      <h1 className="text-lg font-semibold text-gray-800">
-        {pageTitle}
-      </h1>
+      <h1 className="text-lg font-semibold text-gray-800">{pageTitle}</h1>
 
       {/* Right side controls */}
       <div className="flex items-center gap-3">
+        <BranchSwitcher branches={branches} activeBranchId={activeBranchId} />
+
+        <div className="h-6 w-px bg-gray-200" />
 
         {/* Search */}
         <div className="relative hidden md:block">
