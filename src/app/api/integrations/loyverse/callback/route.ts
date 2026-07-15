@@ -6,7 +6,8 @@ import { upsertConnectionFromTokenResponse } from '@/lib/integrations/loyverse/c
 import { LoyverseConfigError } from '@/lib/integrations/loyverse/env'
 
 function redirectToSettings(request: NextRequest, params: Record<string, string>) {
-  const url = new URL('/settings', request.url)
+  const appUrl = process.env.NEXT_PUBLIC_APP_URL?.trim() || request.nextUrl.origin
+  const url = new URL('/settings', appUrl)
   for (const [key, value] of Object.entries(params)) {
     url.searchParams.set(key, value)
   }
