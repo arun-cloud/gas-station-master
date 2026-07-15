@@ -1,0 +1,24 @@
+diff --git a/src/lib/integrations/loyverse/client.ts b/src/lib/integrations/loyverse/client.ts
+index a558cb8..e2898e8 100644
+--- a/src/lib/integrations/loyverse/client.ts
++++ b/src/lib/integrations/loyverse/client.ts
+@@ -74,6 +74,11 @@ async function requestToken(
+     headers: {
+       Accept: 'application/json',
+       'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
++      // Node's fetch sends no User-Agent by default. A missing/blank UA is
++      // a common AWS WAF Bot Control trigger, which is what was causing
++      // Loyverse's edge to return an empty 202 "challenge" response instead
++      // of forwarding to their OAuth token endpoint.
++      'User-Agent': 'GasStationMS/1.0 (+server-to-server OAuth client)',
+     },
+     body: body.toString(),
+     cache: 'no-store',
+@@ -227,6 +232,7 @@ export async function fetchStores(
+     headers: {
+       Accept: 'application/json',
+       Authorization: `Bearer ${accessToken}`,
++      'User-Agent': 'GasStationMS/1.0 (+server-to-server OAuth client)',
+     },
+     cache: 'no-store',
+   })

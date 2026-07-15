@@ -74,13 +74,18 @@ async function requestToken(
     headers: {
       Accept: 'application/json',
       'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+      // Node's fetch sends no User-Agent by default. A missing/blank UA is
+      // a common AWS WAF Bot Control trigger, which is what was causing
+      // Loyverse's edge to return an empty 202 "challenge" response instead
+      // of forwarding to their OAuth token endpoint.
+      'User-Agent': 'GasStationMS/1.0 (+server-to-server OAuth client)',
     },
     body: body.toString(),
     cache: 'no-store',
 
     // Prevent fetch from silently following an unexpected redirect and
     // turning the useful upstream response into something mysterious.
-    redirect: 'manual',
+
   })
 
   const rawBody = await response.text()
@@ -227,6 +232,7 @@ export async function fetchStores(
     headers: {
       Accept: 'application/json',
       Authorization: `Bearer ${accessToken}`,
+      'User-Agent': 'GasStationMS/1.0 (+server-to-server OAuth client)',
     },
     cache: 'no-store',
   })
