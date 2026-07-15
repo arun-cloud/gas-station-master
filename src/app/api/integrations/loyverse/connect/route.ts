@@ -1,52 +1,34 @@
-import { randomBytes } from "crypto";
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from 'next/server'
+import { requireRole, requireBranchAccess, ForbiddenError } from '@/lib/rbac'
+import { buildLoyverseAuthorizeUrl } from '@/lib/integrations/loyverse/client'
+import { createOAuthState } from '@/lib/integrations/loyverse/oauth-state'
+import { LoyverseConfigError } from '@/lib/integrations/loyverse/env'
 
-export async function GET() {
-    const clientId = process.env.LOYVERSE_CLIENT_ID;
-    const redirectUri = process.env.LOYVERSE_REDIRECT_URI;
+// Not covered by middleware.ts (only page routes are), so auth + RBAC are
+// enforced explicitly here, exactly as every Server Action in this app does.
+export async function GET(request: NextRequest) {
+  try {
+    await requireRole(['ADMIN', 'MANAGER'])
 
-    if (!clientId || !redirectUri) {
-        return NextResponse.json(
-            {
-                error:
-                    "Missing LOYVERSE_CLIENT_ID or LOYVERSE_REDIRECT_URI environment variable",
-            },
-            { status: 500 }
-        );
+    const branchId = request.nextUrl.searchParams.get('branchId')
+    if (!branchId) {
+      return NextResponse.json({ error: 'branchId is required' }, { status: 400 })
     }
 
-    const state = randomBytes(32).toString("hex");
+    await requireBranchAccess(branchId)
 
-    const authorizationUrl = new URL(
-        "https://api.loyverse.com/oauth/authorize"
-    );
+    const { state } = await createOAuthState(branchId)
+    const authorizeUrl = buildLoyverseAuthorizeUrl(state)
 
-    authorizationUrl.searchParams.set("client_id", clientId);
-    authorizationUrl.searchParams.set("response_type", "code");
-    authorizationUrl.searchParams.set("redirect_uri", redirectUri);
-    authorizationUrl.searchParams.set(
-        "scope",
-        [
-            "RECEIPTS_READ",
-            "STORES_READ",
-            "ITEMS_READ",
-            "EMPLOYEES_READ",
-            "POS_DEVICES_READ",
-            "PAYMENT_TYPES_READ",
-            "MERCHANT_READ",
-        ].join(" ")
-    );
-    authorizationUrl.searchParams.set("state", state);
-
-    const response = NextResponse.redirect(authorizationUrl);
-
-    response.cookies.set("loyverse_oauth_state", state, {
-        httpOnly: true,
-        secure: true,
-        sameSite: "lax",
-        path: "/",
-        maxAge: 10 * 60,
-    });
-
-    return response;
+    return NextResponse.redirect(authorizeUrl)
+  } catch (error) {
+    if (error instanceof ForbiddenError) {
+      return NextResponse.json({ error: error.message }, { status: 403 })
+    }
+    if (error instanceof LoyverseConfigError) {
+      return NextResponse.json({ error: error.message }, { status: 500 })
+    }
+    console.error('Loyverse connect route failed:', error)
+    return NextResponse.json({ error: 'Failed to start Loyverse connection' }, { status: 500 })
+  }
 }

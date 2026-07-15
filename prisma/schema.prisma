@@ -102,6 +102,8 @@ model Branch {
   userBranches UserBranch[]
   shifts       Shift[]
 
+  loyverseConnection LoyverseConnection?
+
   isActive Boolean @default(true)
 
   // Audit: who created/last modified this branch (nullable — seed data has no actor)
@@ -316,4 +318,51 @@ model Shift {
 enum ShiftStatus {
   ACTIVE
   CLOSED
+}
+
+// ─── Loyverse Integration (Phase 3A: OAuth + token storage) ────
+// One Loyverse "store" maps to exactly one Branch. OAuth consent in
+// Loyverse is granted at the merchant level (not store-scoped), so the
+// specific store is chosen by the admin/manager after the token exchange
+// completes (see PENDING_STORE_SELECTION below).
+enum LoyverseConnectionStatus {
+  PENDING_STORE_SELECTION // token(s) stored, store not yet chosen
+  CONNECTED
+  DISCONNECTED
+  ERROR
+}
+
+model LoyverseConnection {
+  id String @id @default(cuid())
+
+  branchId String @unique
+  branch   Branch @relation(fields: [branchId], references: [id], onDelete: Cascade)
+
+  // Loyverse-side store identity (set once the admin confirms the mapping)
+  storeId   String?
+  storeName String?
+
+  status LoyverseConnectionStatus @default(PENDING_STORE_SELECTION)
+
+  // Tokens are AES-256-GCM encrypted at rest — never stored or logged in
+  // plaintext. See src/lib/integrations/loyverse/crypto.ts.
+  accessTokenEncrypted  String
+  refreshTokenEncrypted String
+  tokenType             String  @default("Bearer")
+  scope                 String?
+  expiresAt             DateTime
+
+  lastRefreshedAt DateTime?
+  // Short, non-sensitive error summary only (never raw provider payloads).
+  lastError       String?
+
+  // Audit: who initiated/last modified this connection
+  createdBy String?
+  updatedBy String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([storeId])
+  @@index([status])
 }

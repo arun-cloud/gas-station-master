@@ -1,105 +1,90 @@
-import { NextRequest, NextResponse } from "next/server";
+import { NextRequest, NextResponse } from 'next/server'
+import { requireBranchAccess, requireUserOrThrow, ForbiddenError } from '@/lib/rbac'
+import { exchangeCodeForToken, fetchStores, LoyverseApiError } from '@/lib/integrations/loyverse/client'
+import { compareAndConsumeState } from '@/lib/integrations/loyverse/oauth-state'
+import { upsertConnectionFromTokenResponse } from '@/lib/integrations/loyverse/connection'
+import { LoyverseConfigError } from '@/lib/integrations/loyverse/env'
 
-interface LoyverseTokenResponse {
-    access_token?: string;
-    token_type?: string;
-    expires_in?: number;
-    refresh_token?: string;
-    scope?: string;
-    error?: string;
-    error_description?: string;
+function redirectToSettings(request: NextRequest, params: Record<string, string>) {
+  const url = new URL('/settings', request.url)
+  for (const [key, value] of Object.entries(params)) {
+    url.searchParams.set(key, value)
+  }
+  return NextResponse.redirect(url)
 }
 
 export async function GET(request: NextRequest) {
-    const code = request.nextUrl.searchParams.get("code");
-    const returnedState = request.nextUrl.searchParams.get("state");
-    const error = request.nextUrl.searchParams.get("error");
+  const code = request.nextUrl.searchParams.get('code')
+  const returnedState = request.nextUrl.searchParams.get('state')
+  const providerError = request.nextUrl.searchParams.get('error')
 
-    if (error) {
-        return NextResponse.redirect(
-            new URL(
-                `/settings?loyverse=failed&error=${encodeURIComponent(error)}`,
-                request.url
-            )
-        );
+  if (providerError) {
+    return redirectToSettings(request, { loyverse: 'failed', error: providerError })
+  }
+
+  const { valid, branchId } = await compareAndConsumeState(returnedState)
+
+  if (!valid || !branchId) {
+    return redirectToSettings(request, { loyverse: 'failed', error: 'invalid_state' })
+  }
+
+  if (!code) {
+    return redirectToSettings(request, { loyverse: 'failed', error: 'missing_code', branchId })
+  }
+
+  try {
+    // Defense in depth: the state cookie already proves this browser started
+    // the flow, but re-check the signed-in user still has access to this
+    // branch before writing anything.
+    const actor = await requireUserOrThrow()
+    await requireBranchAccess(branchId)
+
+    const tokens = await exchangeCodeForToken(code)
+    const stores = await fetchStores(tokens.access_token)
+
+    if (stores.length === 0) {
+      await upsertConnectionFromTokenResponse({
+        branchId,
+        tokens,
+        actorId: actor.id,
+        status: 'ERROR',
+      })
+      return redirectToSettings(request, { loyverse: 'failed', error: 'no_stores_found', branchId })
     }
 
-    if (!code) {
-        return NextResponse.json(
-            { error: "Loyverse authorization code is missing" },
-            { status: 400 }
-        );
+    if (stores.length === 1) {
+      await upsertConnectionFromTokenResponse({
+        branchId,
+        tokens,
+        actorId: actor.id,
+        status: 'CONNECTED',
+        storeId: stores[0].id,
+        storeName: stores[0].name,
+      })
+      return redirectToSettings(request, { loyverse: 'connected', branchId })
     }
 
-    const savedState = request.cookies.get("loyverse_oauth_state")?.value;
-
-    if (!savedState || !returnedState || savedState !== returnedState) {
-        return NextResponse.json(
-            { error: "Invalid OAuth state" },
-            { status: 400 }
-        );
+    // Multiple stores visible to this merchant — persist the tokens now,
+    // but require an explicit choice before treating the connection as live.
+    await upsertConnectionFromTokenResponse({
+      branchId,
+      tokens,
+      actorId: actor.id,
+      status: 'PENDING_STORE_SELECTION',
+    })
+    return redirectToSettings(request, { loyverse: 'select-store', branchId })
+  } catch (error) {
+    if (error instanceof ForbiddenError) {
+      return redirectToSettings(request, { loyverse: 'failed', error: 'forbidden', branchId })
     }
-
-    const clientId = process.env.LOYVERSE_CLIENT_ID;
-    const clientSecret = process.env.LOYVERSE_CLIENT_SECRET;
-    const redirectUri = process.env.LOYVERSE_REDIRECT_URI;
-
-    if (!clientId || !clientSecret || !redirectUri) {
-        return NextResponse.json(
-            { error: "Loyverse OAuth configuration is incomplete" },
-            { status: 500 }
-        );
+    if (error instanceof LoyverseConfigError) {
+      return redirectToSettings(request, { loyverse: 'failed', error: 'not_configured', branchId })
     }
-
-    const tokenResponse = await fetch(
-        "https://api.loyverse.com/oauth/token",
-        {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/x-www-form-urlencoded",
-            },
-            body: new URLSearchParams({
-                client_id: clientId,
-                client_secret: clientSecret,
-                redirect_uri: redirectUri,
-                code,
-                grant_type: "authorization_code",
-            }),
-            cache: "no-store",
-        }
-    );
-
-    const tokenData =
-        (await tokenResponse.json()) as LoyverseTokenResponse;
-
-    if (!tokenResponse.ok || !tokenData.access_token) {
-        console.error("Loyverse token exchange failed", tokenData);
-
-        return NextResponse.json(
-            {
-                error: "Failed to obtain Loyverse access token",
-                details: tokenData,
-            },
-            { status: tokenResponse.status }
-        );
+    if (error instanceof LoyverseApiError) {
+      console.error('Loyverse callback API error:', error.message, error.status)
+      return redirectToSettings(request, { loyverse: 'failed', error: 'provider_error', branchId })
     }
-
-    /*
-     * Save these securely in your database:
-     *
-     * tokenData.access_token
-     * tokenData.refresh_token
-     * tokenData.expires_in
-     * tokenData.scope
-     *
-     * Never return the access token to the browser.
-     */
-
-    const response = NextResponse.redirect(
-        new URL("/settings?loyverse=connected", request.url)
-    );
-
-    response.cookies.delete("loyverse_oauth_state");
-
-    return response;
+    console.error('Loyverse callback failed:', error)
+    return redirectToSettings(request, { loyverse: 'failed', error: 'unknown', branchId })
+  }
 }

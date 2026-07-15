@@ -1,0 +1,1510 @@
+diff --git a/.env.example b/.env.example
+index 4488aaa..3c8ec7f 100644
+--- a/.env.example
++++ b/.env.example
+@@ -12,8 +12,16 @@ NEXTAUTH_URL="http://localhost:3000"
+ # ── App ───────────────────────────────────────────────────
+ NODE_ENV="development"
+ 
+-# ── Loyverse (reserved for Phase 3 — unused until then) ──
+-LOYVERSE_CLIENT_ID=""
+-LOYVERSE_CLIENT_SECRET=""
+-NEXT_PUBLIC_APP_URL="https://ribless-anabelle-glimmeringly.ngrok-free.dev"
+-LOYVERSE_REDIRECT_URI="https://ribless-anabelle-glimmeringly.ngrok-free.dev/api/integrations/loyverse/callback"
++# ── Loyverse (Phase 3A: OAuth + token storage) ───────────
++# Client ID/Secret from your app at https://developer.loyverse.com
++LOYVERSE_CLIENT_ID="replace-with-your-loyverse-app-client-id"
++LOYVERSE_CLIENT_SECRET="replace-with-your-loyverse-app-client-secret"
++# Publicly reachable base URL for this app (e.g. an ngrok/tunnel URL in
++# local dev, or your production domain). Must NOT be committed with a real
++# value — used to build the OAuth redirect URI below.
++NEXT_PUBLIC_APP_URL="https://replace-with-your-public-app-url.example.com"
++# Must exactly match the redirect URI registered in your Loyverse app.
++LOYVERSE_REDIRECT_URI="https://replace-with-your-public-app-url.example.com/api/integrations/loyverse/callback"
++# Generate with: openssl rand -base64 32
++# Used to AES-256-GCM encrypt Loyverse access/refresh tokens at rest.
++LOYVERSE_TOKEN_ENCRYPTION_KEY="replace-with-a-generated-base64-32-byte-key"
+diff --git a/prisma/migrations/20260714120000_add_loyverse_connection/migration.sql b/prisma/migrations/20260714120000_add_loyverse_connection/migration.sql
+new file mode 100644
+index 0000000..599a438
+--- /dev/null
++++ b/prisma/migrations/20260714120000_add_loyverse_connection/migration.sql
+@@ -0,0 +1,45 @@
++-- CreateEnum
++DO $$ BEGIN
++  CREATE TYPE "LoyverseConnectionStatus" AS ENUM ('PENDING_STORE_SELECTION', 'CONNECTED', 'DISCONNECTED', 'ERROR');
++EXCEPTION
++  WHEN duplicate_object THEN null;
++END $$;
++
++-- CreateTable
++CREATE TABLE IF NOT EXISTS "LoyverseConnection" (
++    "id" TEXT NOT NULL,
++    "branchId" TEXT NOT NULL,
++    "storeId" TEXT,
++    "storeName" TEXT,
++    "status" "LoyverseConnectionStatus" NOT NULL DEFAULT 'PENDING_STORE_SELECTION',
++    "accessTokenEncrypted" TEXT NOT NULL,
++    "refreshTokenEncrypted" TEXT NOT NULL,
++    "tokenType" TEXT NOT NULL DEFAULT 'Bearer',
++    "scope" TEXT,
++    "expiresAt" TIMESTAMP(3) NOT NULL,
++    "lastRefreshedAt" TIMESTAMP(3),
++    "lastError" TEXT,
++    "createdBy" TEXT,
++    "updatedBy" TEXT,
++    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
++    "updatedAt" TIMESTAMP(3) NOT NULL,
++
++    CONSTRAINT "LoyverseConnection_pkey" PRIMARY KEY ("id")
++);
++
++-- CreateIndex
++CREATE UNIQUE INDEX IF NOT EXISTS "LoyverseConnection_branchId_key" ON "LoyverseConnection"("branchId");
++
++-- CreateIndex
++CREATE UNIQUE INDEX IF NOT EXISTS "LoyverseConnection_storeId_key" ON "LoyverseConnection"("storeId");
++
++-- CreateIndex
++CREATE INDEX IF NOT EXISTS "LoyverseConnection_status_idx" ON "LoyverseConnection"("status");
++
++-- AddForeignKey
++DO $$ BEGIN
++  ALTER TABLE "LoyverseConnection" ADD CONSTRAINT "LoyverseConnection_branchId_fkey"
++    FOREIGN KEY ("branchId") REFERENCES "Branch"("id") ON DELETE CASCADE ON UPDATE CASCADE;
++EXCEPTION
++  WHEN duplicate_object THEN null;
++END $$;
+diff --git a/prisma/schema.prisma b/prisma/schema.prisma
+index 9cf2905..c457653 100644
+--- a/prisma/schema.prisma
++++ b/prisma/schema.prisma
+@@ -102,6 +102,8 @@ model Branch {
+   userBranches UserBranch[]
+   shifts       Shift[]
+ 
++  loyverseConnection LoyverseConnection?
++
+   isActive Boolean @default(true)
+ 
+   // Audit: who created/last modified this branch (nullable — seed data has no actor)
+@@ -317,3 +319,50 @@ enum ShiftStatus {
+   ACTIVE
+   CLOSED
+ }
++
++// ─── Loyverse Integration (Phase 3A: OAuth + token storage) ────
++// One Loyverse "store" maps to exactly one Branch. OAuth consent in
++// Loyverse is granted at the merchant level (not store-scoped), so the
++// specific store is chosen by the admin/manager after the token exchange
++// completes (see PENDING_STORE_SELECTION below).
++enum LoyverseConnectionStatus {
++  PENDING_STORE_SELECTION // token(s) stored, store not yet chosen
++  CONNECTED
++  DISCONNECTED
++  ERROR
++}
++
++model LoyverseConnection {
++  id String @id @default(cuid())
++
++  branchId String @unique
++  branch   Branch @relation(fields: [branchId], references: [id], onDelete: Cascade)
++
++  // Loyverse-side store identity (set once the admin confirms the mapping)
++  storeId   String?
++  storeName String?
++
++  status LoyverseConnectionStatus @default(PENDING_STORE_SELECTION)
++
++  // Tokens are AES-256-GCM encrypted at rest — never stored or logged in
++  // plaintext. See src/lib/integrations/loyverse/crypto.ts.
++  accessTokenEncrypted  String
++  refreshTokenEncrypted String
++  tokenType             String  @default("Bearer")
++  scope                 String?
++  expiresAt             DateTime
++
++  lastRefreshedAt DateTime?
++  // Short, non-sensitive error summary only (never raw provider payloads).
++  lastError       String?
++
++  // Audit: who initiated/last modified this connection
++  createdBy String?
++  updatedBy String?
++
++  createdAt DateTime @default(now())
++  updatedAt DateTime @updatedAt
++
++  @@unique([storeId])
++  @@index([status])
++}
+diff --git a/src/app/(dashboard)/settings/page.tsx b/src/app/(dashboard)/settings/page.tsx
+index 2dbfe47..8b88a3c 100644
+--- a/src/app/(dashboard)/settings/page.tsx
++++ b/src/app/(dashboard)/settings/page.tsx
+@@ -1,151 +1,104 @@
+-import Link from 'next/link'
+-import {
+-    Link2,
+-    CheckCircle2,
+-    Database,
+-    RefreshCw,
+-    ExternalLink,
+-} from 'lucide-react'
++import { requireUser } from '@/lib/rbac'
++import { resolveActiveBranch } from '@/lib/branch-context'
++import { prisma } from '@/lib/prisma'
++import { fetchStores, type LoyverseStore } from '@/lib/integrations/loyverse/client'
++import { decryptToken } from '@/lib/integrations/loyverse/crypto'
++import LoyverseIntegrationCard from '@/components/settings/LoyverseIntegrationCard'
++import { Building2 } from 'lucide-react'
+ 
+ type SettingsPageProps = {
+-    searchParams: Promise<{
+-        loyverse?: string
+-        error?: string
+-    }>
++  searchParams: Promise<{
++    loyverse?: string
++    error?: string
++    branchId?: string
++  }>
+ }
+ 
+-export default async function SettingsPage({
+-    searchParams,
+-}: SettingsPageProps) {
+-    const params = await searchParams
++// PENDING_STORE_SELECTION connections are, by definition, not yet CONNECTED
++// — getValidLoyverseAccessToken() (used everywhere else) intentionally only
++// serves CONNECTED connections, so this page decrypts directly for the
++// one-time "list stores to choose from" read. This never happens for a
++// live/synced connection.
++async function getPendingAccessToken(branchId: string): Promise<string | null> {
++  const connection = await prisma.loyverseConnection.findUnique({ where: { branchId } })
++  if (!connection || connection.status !== 'PENDING_STORE_SELECTION') return null
++
++  try {
++    return decryptToken(connection.accessTokenEncrypted)
++  } catch {
++    return null
++  }
++}
+ 
+-    const isConnected = params.loyverse === 'connected'
+-    const isFailed = params.loyverse === 'failed'
++export default async function SettingsPage({ searchParams }: SettingsPageProps) {
++  const params = await searchParams
++  const user = await requireUser()
++  const { activeBranch } = await resolveActiveBranch()
+ 
++  if (!activeBranch) {
+     return (
+-        <div className="space-y-6">
+-            {/* Header */}
+-            <div>
+-                <h1 className="text-2xl font-bold text-gray-800">
+-                    Settings
+-                </h1>
+-
+-                <p className="mt-1 text-sm text-gray-500">
+-                    Configure integrations and application preferences.
+-                </p>
+-            </div>
+-
+-            {/* OAuth result */}
+-            {isConnected && (
+-                <div
+-                    className="flex items-center gap-3 rounded-lg border
+-            border-emerald-200 bg-emerald-50 px-4 py-3
+-            text-sm text-emerald-800"
+-                >
+-                    <CheckCircle2 size={18} />
+-
+-                    Loyverse authorization completed successfully.
+-                </div>
+-            )}
+-
+-            {isFailed && (
+-                <div
+-                    className="rounded-lg border border-red-200
+-            bg-red-50 px-4 py-3 text-sm text-red-700"
+-                >
+-                    Loyverse authorization failed
+-                    {params.error ? `: ${params.error}` : '.'}
+-                </div>
+-            )}
+-
+-            {/* Integrations */}
+-            <section className="space-y-4">
+-                <div>
+-                    <h2 className="text-lg font-semibold text-gray-800">
+-                        Integrations
+-                    </h2>
+-
+-                    <p className="text-sm text-gray-500">
+-                        Connect external services used by the fuel station.
+-                    </p>
+-                </div>
+-
+-                {/* Loyverse card */}
+-                <div
+-                    className="rounded-xl border border-gray-200
+-            bg-white p-6 shadow-sm"
+-                >
+-                    <div
+-                        className="flex flex-col gap-5 sm:flex-row
+-              sm:items-center sm:justify-between"
+-                    >
+-                        <div className="flex items-start gap-4">
+-                            <div
+-                                className="flex h-12 w-12 shrink-0 items-center
+-                  justify-center rounded-xl bg-emerald-100
+-                  text-emerald-700"
+-                            >
+-                                <Database size={24} />
+-                            </div>
+-
+-                            <div>
+-                                <div className="flex items-center gap-2">
+-                                    <h3 className="font-semibold text-gray-900">
+-                                        Loyverse POS
+-                                    </h3>
+-
+-                                    {isConnected && (
+-                                        <span
+-                                            className="rounded-full bg-emerald-100
+-                        px-2.5 py-1 text-xs font-medium
+-                        text-emerald-700"
+-                                        >
+-                                            Connected
+-                                        </span>
+-                                    )}
+-                                </div>
+-
+-                                <p className="mt-1 max-w-xl text-sm text-gray-500">
+-                                    Connect Loyverse to import receipts, stores,
+-                                    POS devices, employees, payment types and shifts.
+-                                </p>
+-
+-                                <a
+-                                    href="https://loyverse.com"
+-                                    target="_blank"
+-                                    rel="noreferrer"
+-                                    className="mt-2 inline-flex items-center gap-1
+-                    text-xs font-medium text-gray-500
+-                    hover:text-gray-700"
+-                                >
+-                                    Visit Loyverse
+-                                    <ExternalLink size={12} />
+-                                </a>
+-                            </div>
+-                        </div>
+-
+-                        <Link
+-                            href="/api/integrations/loyverse/connect"
+-                            className="inline-flex items-center justify-center
+-                gap-2 rounded-lg bg-emerald-600 px-4 py-2.5
+-                text-sm font-medium text-white transition-colors
+-                hover:bg-emerald-700"
+-                        >
+-                            {isConnected ? (
+-                                <>
+-                                    <RefreshCw size={16} />
+-                                    Reconnect
+-                                </>
+-                            ) : (
+-                                <>
+-                                    <Link2 size={16} />
+-                                    Connect Loyverse
+-                                </>
+-                            )}
+-                        </Link>
+-                    </div>
+-                </div>
+-            </section>
+-        </div>
++      <div className="rounded-xl border border-amber-200 bg-amber-50 p-5">
++        <Building2 size={24} className="mb-2 text-amber-600" />
++        <h1 className="text-lg font-semibold text-amber-900">No branch access</h1>
++        <p className="mt-1 text-sm text-amber-700">
++          You don&apos;t have access to any active branch yet. Contact an administrator to be
++          assigned to a branch.
++        </p>
++      </div>
+     )
+-}
+\ No newline at end of file
++  }
++
++  const canManage = user.role === 'ADMIN' || user.role === 'MANAGER'
++
++  const connection = await prisma.loyverseConnection.findUnique({
++    where: { branchId: activeBranch.id },
++  })
++
++  let availableStores: LoyverseStore[] = []
++  if (connection?.status === 'PENDING_STORE_SELECTION') {
++    const accessToken = await getPendingAccessToken(activeBranch.id)
++    if (accessToken) {
++      try {
++        availableStores = await fetchStores(accessToken)
++      } catch {
++        availableStores = []
++      }
++    }
++  }
++
++  return (
++    <div className="space-y-6">
++      <div>
++        <h1 className="text-2xl font-bold text-gray-800">Settings</h1>
++        <p className="mt-1 text-sm text-gray-500">
++          Configure integrations for {activeBranch.nameEn} ({activeBranch.branchCode}).
++        </p>
++      </div>
++
++      <section className="space-y-4">
++        <div>
++          <h2 className="text-lg font-semibold text-gray-800">Integrations</h2>
++          <p className="text-sm text-gray-500">Connect external services used by this branch.</p>
++        </div>
++
++        <LoyverseIntegrationCard
++          branchId={activeBranch.id}
++          canManage={canManage}
++          connection={
++            connection
++              ? {
++                  status: connection.status,
++                  storeId: connection.storeId,
++                  storeName: connection.storeName,
++                  lastError: connection.lastError,
++                  updatedAt: connection.updatedAt.toISOString(),
++                }
++              : null
++          }
++          availableStores={availableStores}
++          oauthResult={params.loyverse ? { status: params.loyverse, error: params.error } : null}
++        />
++      </section>
++    </div>
++  )
++}
+diff --git a/src/app/actions/loyverse.actions.ts b/src/app/actions/loyverse.actions.ts
+new file mode 100644
+index 0000000..6bf53eb
+--- /dev/null
++++ b/src/app/actions/loyverse.actions.ts
+@@ -0,0 +1,117 @@
++'use server'
++
++import { revalidatePath } from 'next/cache'
++import { prisma } from '@/lib/prisma'
++import { requireRole, requireBranchAccess, ForbiddenError } from '@/lib/rbac'
++import {
++  selectLoyverseStoreSchema,
++  firstZodMessage,
++} from '@/lib/validation/loyverse.schema'
++
++export type LoyverseActionResult = {
++  success: boolean
++  error?: string
++}
++
++function readSelectStoreFormData(formData: FormData) {
++  return {
++    branchId: formData.get('branchId'),
++    storeId: formData.get('storeId'),
++    storeName: formData.get('storeName'),
++  }
++}
++
++// ── Finalize which Loyverse store maps to this branch ──
++// Used when a merchant has more than one store visible after OAuth — the
++// tokens are already persisted (PENDING_STORE_SELECTION); this just confirms
++// the mapping and flips the connection to CONNECTED.
++export async function selectLoyverseStore(formData: FormData): Promise<LoyverseActionResult> {
++  try {
++    const actor = await requireRole(['ADMIN', 'MANAGER'])
++
++    const parsed = selectLoyverseStoreSchema.safeParse(readSelectStoreFormData(formData))
++    if (!parsed.success) {
++      return { success: false, error: firstZodMessage(parsed.error) }
++    }
++    const data = parsed.data
++
++    await requireBranchAccess(data.branchId)
++
++    const connection = await prisma.loyverseConnection.findUnique({
++      where: { branchId: data.branchId },
++    })
++
++    if (!connection || connection.status !== 'PENDING_STORE_SELECTION') {
++      return { success: false, error: 'No pending Loyverse connection found for this branch' }
++    }
++
++    // A store must map to exactly one branch — the DB-level unique
++    // constraint on storeId is the real guarantee; this check just gives a
++    // friendlier error message before hitting it.
++    const storeTaken = await prisma.loyverseConnection.findFirst({
++      where: { storeId: data.storeId, branchId: { not: data.branchId } },
++      select: { branchId: true },
++    })
++    if (storeTaken) {
++      return { success: false, error: 'This Loyverse store is already linked to another branch' }
++    }
++
++    await prisma.loyverseConnection.update({
++      where: { branchId: data.branchId },
++      data: {
++        storeId: data.storeId,
++        storeName: data.storeName,
++        status: 'CONNECTED',
++        updatedBy: actor.id,
++      },
++    })
++
++    revalidatePath('/settings')
++    return { success: true }
++  } catch (error: unknown) {
++    if (error instanceof ForbiddenError) {
++      return { success: false, error: error.message }
++    }
++    console.error('Failed to finalize Loyverse store selection:', error)
++    return { success: false, error: 'Failed to link the selected store' }
++  }
++}
++
++// ── Disconnect a branch's Loyverse integration ──
++// Loyverse does not document a token-revocation endpoint, so this only
++// stops the app from using the stored tokens locally — it does not revoke
++// merchant-side consent. Tokens are cleared, not just flagged, so a stale
++// encrypted token can never be decrypted and reused later.
++export async function disconnectLoyverse(branchId: string): Promise<LoyverseActionResult> {
++  try {
++    const actor = await requireRole(['ADMIN', 'MANAGER'])
++    await requireBranchAccess(branchId)
++
++    const connection = await prisma.loyverseConnection.findUnique({ where: { branchId } })
++    if (!connection) {
++      return { success: false, error: 'No Loyverse connection found for this branch' }
++    }
++
++    await prisma.loyverseConnection.update({
++      where: { branchId },
++      data: {
++        status: 'DISCONNECTED',
++        accessTokenEncrypted: '',
++        refreshTokenEncrypted: '',
++        storeId: null,
++        storeName: null,
++        lastError: null,
++        updatedBy: actor.id,
++      },
++    })
++
++    revalidatePath('/settings')
++    return { success: true }
++  } catch (error: unknown) {
++    if (error instanceof ForbiddenError) {
++      return { success: false, error: error.message }
++    }
++    console.error('Failed to disconnect Loyverse:', error)
++    return { success: false, error: 'Failed to disconnect Loyverse' }
++  }
++}
+diff --git a/src/app/api/integrations/loyverse/callback/route.ts b/src/app/api/integrations/loyverse/callback/route.ts
+index fe39b9c..d2b759a 100644
+--- a/src/app/api/integrations/loyverse/callback/route.ts
++++ b/src/app/api/integrations/loyverse/callback/route.ts
+@@ -1,105 +1,90 @@
+-import { NextRequest, NextResponse } from "next/server";
+-
+-interface LoyverseTokenResponse {
+-    access_token?: string;
+-    token_type?: string;
+-    expires_in?: number;
+-    refresh_token?: string;
+-    scope?: string;
+-    error?: string;
+-    error_description?: string;
++import { NextRequest, NextResponse } from 'next/server'
++import { requireBranchAccess, requireUserOrThrow, ForbiddenError } from '@/lib/rbac'
++import { exchangeCodeForToken, fetchStores, LoyverseApiError } from '@/lib/integrations/loyverse/client'
++import { compareAndConsumeState } from '@/lib/integrations/loyverse/oauth-state'
++import { upsertConnectionFromTokenResponse } from '@/lib/integrations/loyverse/connection'
++import { LoyverseConfigError } from '@/lib/integrations/loyverse/env'
++
++function redirectToSettings(request: NextRequest, params: Record<string, string>) {
++  const url = new URL('/settings', request.url)
++  for (const [key, value] of Object.entries(params)) {
++    url.searchParams.set(key, value)
++  }
++  return NextResponse.redirect(url)
+ }
+ 
+ export async function GET(request: NextRequest) {
+-    const code = request.nextUrl.searchParams.get("code");
+-    const returnedState = request.nextUrl.searchParams.get("state");
+-    const error = request.nextUrl.searchParams.get("error");
+-
+-    if (error) {
+-        return NextResponse.redirect(
+-            new URL(
+-                `/settings?loyverse=failed&error=${encodeURIComponent(error)}`,
+-                request.url
+-            )
+-        );
++  const code = request.nextUrl.searchParams.get('code')
++  const returnedState = request.nextUrl.searchParams.get('state')
++  const providerError = request.nextUrl.searchParams.get('error')
++
++  if (providerError) {
++    return redirectToSettings(request, { loyverse: 'failed', error: providerError })
++  }
++
++  const { valid, branchId } = await compareAndConsumeState(returnedState)
++
++  if (!valid || !branchId) {
++    return redirectToSettings(request, { loyverse: 'failed', error: 'invalid_state' })
++  }
++
++  if (!code) {
++    return redirectToSettings(request, { loyverse: 'failed', error: 'missing_code', branchId })
++  }
++
++  try {
++    // Defense in depth: the state cookie already proves this browser started
++    // the flow, but re-check the signed-in user still has access to this
++    // branch before writing anything.
++    const actor = await requireUserOrThrow()
++    await requireBranchAccess(branchId)
++
++    const tokens = await exchangeCodeForToken(code)
++    const stores = await fetchStores(tokens.access_token)
++
++    if (stores.length === 0) {
++      await upsertConnectionFromTokenResponse({
++        branchId,
++        tokens,
++        actorId: actor.id,
++        status: 'ERROR',
++      })
++      return redirectToSettings(request, { loyverse: 'failed', error: 'no_stores_found', branchId })
+     }
+ 
+-    if (!code) {
+-        return NextResponse.json(
+-            { error: "Loyverse authorization code is missing" },
+-            { status: 400 }
+-        );
++    if (stores.length === 1) {
++      await upsertConnectionFromTokenResponse({
++        branchId,
++        tokens,
++        actorId: actor.id,
++        status: 'CONNECTED',
++        storeId: stores[0].id,
++        storeName: stores[0].name,
++      })
++      return redirectToSettings(request, { loyverse: 'connected', branchId })
+     }
+ 
+-    const savedState = request.cookies.get("loyverse_oauth_state")?.value;
+-
+-    if (!savedState || !returnedState || savedState !== returnedState) {
+-        return NextResponse.json(
+-            { error: "Invalid OAuth state" },
+-            { status: 400 }
+-        );
++    // Multiple stores visible to this merchant — persist the tokens now,
++    // but require an explicit choice before treating the connection as live.
++    await upsertConnectionFromTokenResponse({
++      branchId,
++      tokens,
++      actorId: actor.id,
++      status: 'PENDING_STORE_SELECTION',
++    })
++    return redirectToSettings(request, { loyverse: 'select-store', branchId })
++  } catch (error) {
++    if (error instanceof ForbiddenError) {
++      return redirectToSettings(request, { loyverse: 'failed', error: 'forbidden', branchId })
+     }
+-
+-    const clientId = process.env.LOYVERSE_CLIENT_ID;
+-    const clientSecret = process.env.LOYVERSE_CLIENT_SECRET;
+-    const redirectUri = process.env.LOYVERSE_REDIRECT_URI;
+-
+-    if (!clientId || !clientSecret || !redirectUri) {
+-        return NextResponse.json(
+-            { error: "Loyverse OAuth configuration is incomplete" },
+-            { status: 500 }
+-        );
++    if (error instanceof LoyverseConfigError) {
++      return redirectToSettings(request, { loyverse: 'failed', error: 'not_configured', branchId })
+     }
+-
+-    const tokenResponse = await fetch(
+-        "https://api.loyverse.com/oauth/token",
+-        {
+-            method: "POST",
+-            headers: {
+-                "Content-Type": "application/x-www-form-urlencoded",
+-            },
+-            body: new URLSearchParams({
+-                client_id: clientId,
+-                client_secret: clientSecret,
+-                redirect_uri: redirectUri,
+-                code,
+-                grant_type: "authorization_code",
+-            }),
+-            cache: "no-store",
+-        }
+-    );
+-
+-    const tokenData =
+-        (await tokenResponse.json()) as LoyverseTokenResponse;
+-
+-    if (!tokenResponse.ok || !tokenData.access_token) {
+-        console.error("Loyverse token exchange failed", tokenData);
+-
+-        return NextResponse.json(
+-            {
+-                error: "Failed to obtain Loyverse access token",
+-                details: tokenData,
+-            },
+-            { status: tokenResponse.status }
+-        );
++    if (error instanceof LoyverseApiError) {
++      console.error('Loyverse callback API error:', error.message, error.status)
++      return redirectToSettings(request, { loyverse: 'failed', error: 'provider_error', branchId })
+     }
+-
+-    /*
+-     * Save these securely in your database:
+-     *
+-     * tokenData.access_token
+-     * tokenData.refresh_token
+-     * tokenData.expires_in
+-     * tokenData.scope
+-     *
+-     * Never return the access token to the browser.
+-     */
+-
+-    const response = NextResponse.redirect(
+-        new URL("/settings?loyverse=connected", request.url)
+-    );
+-
+-    response.cookies.delete("loyverse_oauth_state");
+-
+-    return response;
+-}
+\ No newline at end of file
++    console.error('Loyverse callback failed:', error)
++    return redirectToSettings(request, { loyverse: 'failed', error: 'unknown', branchId })
++  }
++}
+diff --git a/src/app/api/integrations/loyverse/connect/route.ts b/src/app/api/integrations/loyverse/connect/route.ts
+index ce04fd2..21b4cb9 100644
+--- a/src/app/api/integrations/loyverse/connect/route.ts
++++ b/src/app/api/integrations/loyverse/connect/route.ts
+@@ -1,52 +1,34 @@
+-import { randomBytes } from "crypto";
+-import { NextResponse } from "next/server";
+-
+-export async function GET() {
+-    const clientId = process.env.LOYVERSE_CLIENT_ID;
+-    const redirectUri = process.env.LOYVERSE_REDIRECT_URI;
+-
+-    if (!clientId || !redirectUri) {
+-        return NextResponse.json(
+-            {
+-                error:
+-                    "Missing LOYVERSE_CLIENT_ID or LOYVERSE_REDIRECT_URI environment variable",
+-            },
+-            { status: 500 }
+-        );
++import { NextRequest, NextResponse } from 'next/server'
++import { requireRole, requireBranchAccess, ForbiddenError } from '@/lib/rbac'
++import { buildLoyverseAuthorizeUrl } from '@/lib/integrations/loyverse/client'
++import { createOAuthState } from '@/lib/integrations/loyverse/oauth-state'
++import { LoyverseConfigError } from '@/lib/integrations/loyverse/env'
++
++// Not covered by middleware.ts (only page routes are), so auth + RBAC are
++// enforced explicitly here, exactly as every Server Action in this app does.
++export async function GET(request: NextRequest) {
++  try {
++    await requireRole(['ADMIN', 'MANAGER'])
++
++    const branchId = request.nextUrl.searchParams.get('branchId')
++    if (!branchId) {
++      return NextResponse.json({ error: 'branchId is required' }, { status: 400 })
+     }
+ 
+-    const state = randomBytes(32).toString("hex");
+-
+-    const authorizationUrl = new URL(
+-        "https://api.loyverse.com/oauth/authorize"
+-    );
+-
+-    authorizationUrl.searchParams.set("client_id", clientId);
+-    authorizationUrl.searchParams.set("response_type", "code");
+-    authorizationUrl.searchParams.set("redirect_uri", redirectUri);
+-    authorizationUrl.searchParams.set(
+-        "scope",
+-        [
+-            "RECEIPTS_READ",
+-            "STORES_READ",
+-            "ITEMS_READ",
+-            "EMPLOYEES_READ",
+-            "POS_DEVICES_READ",
+-            "PAYMENT_TYPES_READ",
+-            "MERCHANT_READ",
+-        ].join(" ")
+-    );
+-    authorizationUrl.searchParams.set("state", state);
++    await requireBranchAccess(branchId)
+ 
+-    const response = NextResponse.redirect(authorizationUrl);
++    const { state } = await createOAuthState(branchId)
++    const authorizeUrl = buildLoyverseAuthorizeUrl(state)
+ 
+-    response.cookies.set("loyverse_oauth_state", state, {
+-        httpOnly: true,
+-        secure: true,
+-        sameSite: "lax",
+-        path: "/",
+-        maxAge: 10 * 60,
+-    });
+-
+-    return response;
+-}
+\ No newline at end of file
++    return NextResponse.redirect(authorizeUrl)
++  } catch (error) {
++    if (error instanceof ForbiddenError) {
++      return NextResponse.json({ error: error.message }, { status: 403 })
++    }
++    if (error instanceof LoyverseConfigError) {
++      return NextResponse.json({ error: error.message }, { status: 500 })
++    }
++    console.error('Loyverse connect route failed:', error)
++    return NextResponse.json({ error: 'Failed to start Loyverse connection' }, { status: 500 })
++  }
++}
+diff --git a/src/components/settings/LoyverseIntegrationCard.tsx b/src/components/settings/LoyverseIntegrationCard.tsx
+new file mode 100644
+index 0000000..c3ca22f
+--- /dev/null
++++ b/src/components/settings/LoyverseIntegrationCard.tsx
+@@ -0,0 +1,231 @@
++'use client'
++
++import { useState, useTransition } from 'react'
++import {
++  Link2,
++  CheckCircle2,
++  Database,
++  RefreshCw,
++  ExternalLink,
++  AlertTriangle,
++  Unlink,
++} from 'lucide-react'
++import { selectLoyverseStore, disconnectLoyverse } from '@/app/actions/loyverse.actions'
++
++type ConnectionStatus = 'PENDING_STORE_SELECTION' | 'CONNECTED' | 'DISCONNECTED' | 'ERROR'
++
++type LoyverseIntegrationCardProps = {
++  branchId: string
++  canManage: boolean
++  connection: {
++    status: ConnectionStatus
++    storeId: string | null
++    storeName: string | null
++    lastError: string | null
++    updatedAt: string
++  } | null
++  availableStores: { id: string; name: string }[]
++  oauthResult: { status: string; error?: string } | null
++}
++
++const OAUTH_ERROR_MESSAGES: Record<string, string> = {
++  invalid_state: 'The connection request expired or could not be verified. Please try again.',
++  missing_code: 'Loyverse did not return an authorization code. Please try again.',
++  forbidden: 'You no longer have access to this branch.',
++  not_configured: 'Loyverse integration is not configured on this server.',
++  no_stores_found: 'No stores were found on this Loyverse account.',
++  provider_error: 'Loyverse rejected the request. Please try again.',
++  unknown: 'Something went wrong connecting to Loyverse.',
++}
++
++export default function LoyverseIntegrationCard({
++  branchId,
++  canManage,
++  connection,
++  availableStores,
++  oauthResult,
++}: LoyverseIntegrationCardProps) {
++  const [isPending, startTransition] = useTransition()
++  const [selectedStoreId, setSelectedStoreId] = useState<string>('')
++  const [formError, setFormError] = useState<string | null>(null)
++
++  const status = connection?.status ?? null
++  const connectHref = `/api/integrations/loyverse/connect?branchId=${branchId}`
++
++  function handleSelectStore(event: React.FormEvent<HTMLFormElement>) {
++    event.preventDefault()
++    setFormError(null)
++
++    const store = availableStores.find((s) => s.id === selectedStoreId)
++    if (!store) {
++      setFormError('Please select a store')
++      return
++    }
++
++    const formData = new FormData()
++    formData.set('branchId', branchId)
++    formData.set('storeId', store.id)
++    formData.set('storeName', store.name)
++
++    startTransition(async () => {
++      const result = await selectLoyverseStore(formData)
++      if (!result.success) {
++        setFormError(result.error ?? 'Failed to link the selected store')
++        return
++      }
++      window.location.reload()
++    })
++  }
++
++  function handleDisconnect() {
++    setFormError(null)
++    startTransition(async () => {
++      const result = await disconnectLoyverse(branchId)
++      if (!result.success) {
++        setFormError(result.error ?? 'Failed to disconnect')
++        return
++      }
++      window.location.reload()
++    })
++  }
++
++  return (
++    <div className="rounded-xl border border-gray-200 bg-white p-6 shadow-sm">
++      {oauthResult?.status === 'connected' && (
++        <div className="mb-4 flex items-center gap-3 rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-800">
++          <CheckCircle2 size={18} />
++          Loyverse authorization completed successfully.
++        </div>
++      )}
++      {oauthResult?.status === 'failed' && (
++        <div className="mb-4 flex items-center gap-3 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
++          <AlertTriangle size={18} />
++          {OAUTH_ERROR_MESSAGES[oauthResult.error ?? 'unknown'] ?? OAUTH_ERROR_MESSAGES.unknown}
++        </div>
++      )}
++
++      <div className="flex flex-col gap-5 sm:flex-row sm:items-center sm:justify-between">
++        <div className="flex items-start gap-4">
++          <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-xl bg-emerald-100 text-emerald-700">
++            <Database size={24} />
++          </div>
++          <div>
++            <div className="flex items-center gap-2">
++              <h3 className="font-semibold text-gray-900">Loyverse POS</h3>
++              {status === 'CONNECTED' && (
++                <span className="rounded-full bg-emerald-100 px-2.5 py-1 text-xs font-medium text-emerald-700">
++                  Connected{connection?.storeName ? ` · ${connection.storeName}` : ''}
++                </span>
++              )}
++              {status === 'PENDING_STORE_SELECTION' && (
++                <span className="rounded-full bg-amber-100 px-2.5 py-1 text-xs font-medium text-amber-700">
++                  Select a store
++                </span>
++              )}
++              {status === 'ERROR' && (
++                <span className="rounded-full bg-red-100 px-2.5 py-1 text-xs font-medium text-red-700">
++                  Connection error
++                </span>
++              )}
++              {(status === 'DISCONNECTED' || !status) && (
++                <span className="rounded-full bg-gray-100 px-2.5 py-1 text-xs font-medium text-gray-600">
++                  Not connected
++                </span>
++              )}
++            </div>
++            <p className="mt-1 max-w-xl text-sm text-gray-500">
++              Connect Loyverse to import receipts, stores, POS devices, employees, payment types
++              and shifts for this branch.
++            </p>
++            {status === 'ERROR' && connection?.lastError && (
++              <p className="mt-1 text-xs text-red-600">{connection.lastError}</p>
++            )}
++            <a
++              href="https://loyverse.com"
++              target="_blank"
++              rel="noreferrer"
++              className="mt-2 inline-flex items-center gap-1 text-xs font-medium text-gray-500 hover:text-gray-700"
++            >
++              Visit Loyverse
++              <ExternalLink size={12} />
++            </a>
++          </div>
++        </div>
++
++        {canManage && status !== 'PENDING_STORE_SELECTION' && (
++          <div className="flex shrink-0 gap-2">
++            <a
++              href={connectHref}
++              className="inline-flex items-center justify-center gap-2 rounded-lg bg-emerald-600 px-4 py-2.5 text-sm font-medium text-white transition-colors hover:bg-emerald-700"
++            >
++              {status === 'CONNECTED' ? (
++                <>
++                  <RefreshCw size={16} />
++                  Reconnect
++                </>
++              ) : (
++                <>
++                  <Link2 size={16} />
++                  Connect Loyverse
++                </>
++              )}
++            </a>
++            {status === 'CONNECTED' && (
++              <button
++                type="button"
++                onClick={handleDisconnect}
++                disabled={isPending}
++                className="inline-flex items-center justify-center gap-2 rounded-lg border border-gray-200 px-4 py-2.5 text-sm font-medium text-gray-600 transition-colors hover:bg-gray-50 disabled:opacity-60"
++              >
++                <Unlink size={16} />
++                Disconnect
++              </button>
++            )}
++          </div>
++        )}
++      </div>
++
++      {status === 'PENDING_STORE_SELECTION' && canManage && (
++        <div className="mt-5 rounded-lg border border-amber-200 bg-amber-50 p-4">
++          <p className="mb-3 text-sm font-medium text-amber-900">
++            This Loyverse account has multiple stores. Choose the one that matches this branch.
++          </p>
++          {availableStores.length === 0 ? (
++            <p className="text-sm text-amber-700">
++              Couldn&apos;t load the store list — try reconnecting.
++            </p>
++          ) : (
++            <form onSubmit={handleSelectStore} className="space-y-3">
++              <div className="space-y-2">
++                {availableStores.map((store) => (
++                  <label
++                    key={store.id}
++                    className="flex items-center gap-2 rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm text-gray-700"
++                  >
++                    <input
++                      type="radio"
++                      name="storeId"
++                      value={store.id}
++                      checked={selectedStoreId === store.id}
++                      onChange={() => setSelectedStoreId(store.id)}
++                    />
++                    {store.name}
++                  </label>
++                ))}
++              </div>
++              <button
++                type="submit"
++                disabled={isPending || !selectedStoreId}
++                className="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-700 disabled:opacity-60"
++              >
++                Link store
++              </button>
++            </form>
++          )}
++        </div>
++      )}
++
++      {formError && <p className="mt-3 text-sm text-red-600">{formError}</p>}
++    </div>
++  )
++}
+diff --git a/src/lib/integrations/loyverse/client.ts b/src/lib/integrations/loyverse/client.ts
+new file mode 100644
+index 0000000..0be2673
+--- /dev/null
++++ b/src/lib/integrations/loyverse/client.ts
+@@ -0,0 +1,157 @@
++import 'server-only'
++import { getLoyverseEnv } from './env'
++
++// ─── Documented Loyverse endpoints used here ────────────────────────────
++// https://developer.loyverse.com (OAuth2 authorization code flow + REST API)
++//   - Authorize:    GET  https://api.loyverse.com/oauth/authorize
++//   - Token/Refresh:POST https://api.loyverse.com/oauth/token
++//   - Stores:       GET  https://api.loyverse.com/v1/stores
++// No webhook subscription or receipt endpoints are called in this phase —
++// those belong to Phase 3B and will be verified against the live developer
++// dashboard before implementation, per the "don't invent endpoints" rule.
++
++const LOYVERSE_AUTHORIZE_URL = 'https://api.loyverse.com/oauth/authorize'
++const LOYVERSE_TOKEN_URL = 'https://api.loyverse.com/oauth/token'
++const LOYVERSE_STORES_URL = 'https://api.loyverse.com/v1/stores'
++
++// Minimum scopes needed for Phase 3B (receipt sync) plus store/employee
++// context. Kept identical to what was already requested by the existing
++// (prototype) connect route so no re-consent surprises for already-tested
++// merchants.
++export const LOYVERSE_OAUTH_SCOPES = [
++  'RECEIPTS_READ',
++  'STORES_READ',
++  'ITEMS_READ',
++  'EMPLOYEES_READ',
++  'POS_DEVICES_READ',
++  'PAYMENT_TYPES_READ',
++  'MERCHANT_READ',
++] as const
++
++export function buildLoyverseAuthorizeUrl(state: string): string {
++  const { LOYVERSE_CLIENT_ID, LOYVERSE_REDIRECT_URI } = getLoyverseEnv()
++
++  const url = new URL(LOYVERSE_AUTHORIZE_URL)
++  url.searchParams.set('client_id', LOYVERSE_CLIENT_ID)
++  url.searchParams.set('response_type', 'code')
++  url.searchParams.set('redirect_uri', LOYVERSE_REDIRECT_URI)
++  url.searchParams.set('scope', LOYVERSE_OAUTH_SCOPES.join(' '))
++  url.searchParams.set('state', state)
++  return url.toString()
++}
++
++export interface LoyverseTokenResponse {
++  access_token: string
++  token_type: string
++  expires_in: number
++  refresh_token: string
++  scope?: string
++}
++
++interface LoyverseTokenErrorResponse {
++  error?: string
++  error_description?: string
++}
++
++export class LoyverseApiError extends Error {
++  constructor(
++    message: string,
++    public readonly status: number,
++  ) {
++    super(message)
++    this.name = 'LoyverseApiError'
++  }
++}
++
++async function requestToken(body: URLSearchParams): Promise<LoyverseTokenResponse> {
++  const response = await fetch(LOYVERSE_TOKEN_URL, {
++    method: 'POST',
++    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
++    body,
++    cache: 'no-store',
++  })
++
++  const data = (await response.json()) as LoyverseTokenResponse | LoyverseTokenErrorResponse
++
++  if (!response.ok || !('access_token' in data) || !data.access_token) {
++    // Log only the error code, never the full response (which could echo
++    // back client secrets or partial tokens on some providers).
++    const errorCode = 'error' in data ? data.error : 'unknown_error'
++    console.error(`Loyverse token request failed: ${errorCode ?? 'unknown_error'} (status ${response.status})`)
++    throw new LoyverseApiError('Failed to obtain a token from Loyverse', response.status)
++  }
++
++  return data
++}
++
++export function exchangeCodeForToken(code: string): Promise<LoyverseTokenResponse> {
++  const { LOYVERSE_CLIENT_ID, LOYVERSE_CLIENT_SECRET, LOYVERSE_REDIRECT_URI } = getLoyverseEnv()
++
++  return requestToken(
++    new URLSearchParams({
++      client_id: LOYVERSE_CLIENT_ID,
++      client_secret: LOYVERSE_CLIENT_SECRET,
++      redirect_uri: LOYVERSE_REDIRECT_URI,
++      code,
++      grant_type: 'authorization_code',
++    }),
++  )
++}
++
++export function refreshAccessToken(refreshToken: string): Promise<LoyverseTokenResponse> {
++  const { LOYVERSE_CLIENT_ID, LOYVERSE_CLIENT_SECRET } = getLoyverseEnv()
++
++  return requestToken(
++    new URLSearchParams({
++      client_id: LOYVERSE_CLIENT_ID,
++      client_secret: LOYVERSE_CLIENT_SECRET,
++      refresh_token: refreshToken,
++      grant_type: 'refresh_token',
++    }),
++  )
++}
++
++export interface LoyverseStore {
++  id: string
++  name: string
++}
++
++/**
++ * Fetches the list of stores visible to the connected merchant.
++ * Loyverse list endpoints conventionally wrap results in an object keyed
++ * by the resource name (e.g. `{ "stores": [...] }`) — parsed defensively
++ * here since this could not be re-verified against the live (JS-rendered)
++ * developer dashboard from this environment. Recommend spot-checking one
++ * real response against your Loyverse app before relying on this in
++ * production.
++ */
++export async function fetchStores(accessToken: string): Promise<LoyverseStore[]> {
++  const response = await fetch(LOYVERSE_STORES_URL, {
++    headers: { Authorization: `Bearer ${accessToken}` },
++    cache: 'no-store',
++  })
++
++  if (!response.ok) {
++    console.error(`Loyverse stores request failed: status ${response.status}`)
++    throw new LoyverseApiError('Failed to fetch stores from Loyverse', response.status)
++  }
++
++  const data = (await response.json()) as unknown
++
++  const rawList = Array.isArray(data)
++    ? data
++    : Array.isArray((data as { stores?: unknown })?.stores)
++      ? (data as { stores: unknown[] }).stores
++      : null
++
++  if (!rawList) {
++    throw new LoyverseApiError('Unexpected response shape from Loyverse stores endpoint', 502)
++  }
++
++  return rawList
++    .filter((item): item is { id: string; name: string } => {
++      const candidate = item as { id?: unknown; name?: unknown }
++      return typeof candidate?.id === 'string' && typeof candidate?.name === 'string'
++    })
++    .map((store) => ({ id: store.id, name: store.name }))
++}
+diff --git a/src/lib/integrations/loyverse/connection.ts b/src/lib/integrations/loyverse/connection.ts
+new file mode 100644
+index 0000000..2af2b70
+--- /dev/null
++++ b/src/lib/integrations/loyverse/connection.ts
+@@ -0,0 +1,109 @@
++import 'server-only'
++import { prisma } from '@/lib/prisma'
++import { encryptToken, decryptToken } from './crypto'
++import { refreshAccessToken, type LoyverseTokenResponse } from './client'
++import type { LoyverseConnectionStatus } from '../../../../prisma/generated/client'
++
++// Refresh a bit before actual expiry to absorb clock skew and request
++// latency — never let an in-flight request race a token that expires
++// mid-call.
++const REFRESH_SKEW_MS = 60_000
++
++function expiresAtFromNow(expiresInSeconds: number): Date {
++  return new Date(Date.now() + expiresInSeconds * 1000)
++}
++
++export async function upsertConnectionFromTokenResponse(params: {
++  branchId: string
++  tokens: LoyverseTokenResponse
++  actorId: string
++  status: LoyverseConnectionStatus
++  storeId?: string
++  storeName?: string
++}) {
++  const { branchId, tokens, actorId, status, storeId, storeName } = params
++
++  return prisma.loyverseConnection.upsert({
++    where: { branchId },
++    create: {
++      branchId,
++      status,
++      storeId: storeId ?? null,
++      storeName: storeName ?? null,
++      accessTokenEncrypted: encryptToken(tokens.access_token),
++      refreshTokenEncrypted: encryptToken(tokens.refresh_token),
++      tokenType: tokens.token_type ?? 'Bearer',
++      scope: tokens.scope,
++      expiresAt: expiresAtFromNow(tokens.expires_in),
++      lastRefreshedAt: new Date(),
++      createdBy: actorId,
++      updatedBy: actorId,
++    },
++    update: {
++      status,
++      storeId: storeId ?? undefined,
++      storeName: storeName ?? undefined,
++      accessTokenEncrypted: encryptToken(tokens.access_token),
++      refreshTokenEncrypted: encryptToken(tokens.refresh_token),
++      tokenType: tokens.token_type ?? 'Bearer',
++      scope: tokens.scope,
++      expiresAt: expiresAtFromNow(tokens.expires_in),
++      lastRefreshedAt: new Date(),
++      lastError: null,
++      updatedBy: actorId,
++    },
++  })
++}
++
++/**
++ * Returns a valid (non-expired) Loyverse access token for the given branch,
++ * transparently refreshing it if it's expired or about to expire. Intended
++ * for server-side use only (Phase 3B sync jobs / API calls) — the token
++ * itself must never be sent to the browser.
++ *
++ * Returns null if the branch has no CONNECTED Loyverse integration.
++ */
++export async function getValidLoyverseAccessToken(branchId: string): Promise<string | null> {
++  const connection = await prisma.loyverseConnection.findUnique({ where: { branchId } })
++
++  if (!connection || connection.status !== 'CONNECTED') {
++    return null
++  }
++
++  const needsRefresh = connection.expiresAt.getTime() - REFRESH_SKEW_MS <= Date.now()
++
++  if (!needsRefresh) {
++    return decryptToken(connection.accessTokenEncrypted)
++  }
++
++  try {
++    const refreshToken = decryptToken(connection.refreshTokenEncrypted)
++    const tokens = await refreshAccessToken(refreshToken)
++
++    const updated = await prisma.loyverseConnection.update({
++      where: { branchId },
++      data: {
++        accessTokenEncrypted: encryptToken(tokens.access_token),
++        // Loyverse may or may not rotate the refresh token on use — if a
++        // new one isn't returned, keep the existing (still-valid) one.
++        refreshTokenEncrypted: tokens.refresh_token
++          ? encryptToken(tokens.refresh_token)
++          : connection.refreshTokenEncrypted,
++        tokenType: tokens.token_type ?? connection.tokenType,
++        scope: tokens.scope ?? connection.scope,
++        expiresAt: expiresAtFromNow(tokens.expires_in),
++        lastRefreshedAt: new Date(),
++        lastError: null,
++      },
++    })
++
++    return decryptToken(updated.accessTokenEncrypted)
++  } catch (error) {
++    console.error(`Loyverse token refresh failed for branch ${branchId}:`, error)
++    await prisma.loyverseConnection.update({
++      where: { branchId },
++      data: { status: 'ERROR', lastError: 'Token refresh failed — reconnect required' },
++    })
++    return null
++  }
++}
+diff --git a/src/lib/integrations/loyverse/crypto.ts b/src/lib/integrations/loyverse/crypto.ts
+new file mode 100644
+index 0000000..5117cad
+--- /dev/null
++++ b/src/lib/integrations/loyverse/crypto.ts
+@@ -0,0 +1,52 @@
++import 'server-only'
++import { randomBytes, createCipheriv, createDecipheriv } from 'crypto'
++import { getLoyverseEnv } from './env'
++
++const ALGORITHM = 'aes-256-gcm'
++const IV_LENGTH_BYTES = 12 // recommended IV length for GCM
++
++/**
++ * Encrypts a token (access_token / refresh_token) for storage.
++ * Output layout (all base64, concatenated with `.`): iv.authTag.ciphertext
++ */
++export function encryptToken(plaintext: string): string {
++  const { LOYVERSE_TOKEN_ENCRYPTION_KEY } = getLoyverseEnv()
++  const key = Buffer.from(LOYVERSE_TOKEN_ENCRYPTION_KEY, 'base64')
++
++  const iv = randomBytes(IV_LENGTH_BYTES)
++  const cipher = createCipheriv(ALGORITHM, key, iv)
++
++  const ciphertext = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()])
++  const authTag = cipher.getAuthTag()
++
++  return [iv.toString('base64'), authTag.toString('base64'), ciphertext.toString('base64')].join(
++    '.',
++  )
++}
++
++/**
++ * Decrypts a token previously produced by encryptToken.
++ * Throws if the payload is malformed or the auth tag doesn't verify
++ * (tampering, wrong key, or corrupted data) — callers should treat any
++ * thrown error as "this token can no longer be trusted."
++ */
++export function decryptToken(payload: string): string {
++  const { LOYVERSE_TOKEN_ENCRYPTION_KEY } = getLoyverseEnv()
++  const key = Buffer.from(LOYVERSE_TOKEN_ENCRYPTION_KEY, 'base64')
++
++  const parts = payload.split('.')
++  if (parts.length !== 3) {
++    throw new Error('Malformed encrypted token payload')
++  }
++  const [ivB64, authTagB64, ciphertextB64] = parts
++
++  const iv = Buffer.from(ivB64, 'base64')
++  const authTag = Buffer.from(authTagB64, 'base64')
++  const ciphertext = Buffer.from(ciphertextB64, 'base64')
++
++  const decipher = createDecipheriv(ALGORITHM, key, iv)
++  decipher.setAuthTag(authTag)
++
++  const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()])
++  return plaintext.toString('utf8')
++}
+diff --git a/src/lib/integrations/loyverse/env.ts b/src/lib/integrations/loyverse/env.ts
+new file mode 100644
+index 0000000..e3c6385
+--- /dev/null
++++ b/src/lib/integrations/loyverse/env.ts
+@@ -0,0 +1,54 @@
++import 'server-only'
++import { z } from 'zod'
++
++// Validated lazily (per-call), not at module load time. This keeps a
++// missing/incomplete Loyverse configuration from crashing routes that have
++// nothing to do with Loyverse — only the integration endpoints themselves
++// fail, with a clean error, until the operator finishes configuration.
++const loyverseEnvSchema = z.object({
++  LOYVERSE_CLIENT_ID: z.string().min(1, 'LOYVERSE_CLIENT_ID is required'),
++  LOYVERSE_CLIENT_SECRET: z.string().min(1, 'LOYVERSE_CLIENT_SECRET is required'),
++  LOYVERSE_REDIRECT_URI: z
++    .string()
++    .url('LOYVERSE_REDIRECT_URI must be a valid absolute URL'),
++  NEXT_PUBLIC_APP_URL: z
++    .string()
++    .url('NEXT_PUBLIC_APP_URL must be a valid absolute URL'),
++  LOYVERSE_TOKEN_ENCRYPTION_KEY: z
++    .string()
++    .refine((value) => {
++      try {
++        return Buffer.from(value, 'base64').length === 32
++      } catch {
++        return false
++      }
++    }, 'LOYVERSE_TOKEN_ENCRYPTION_KEY must be a base64-encoded 32-byte key — generate with `openssl rand -base64 32`'),
++})
++
++export type LoyverseEnv = z.infer<typeof loyverseEnvSchema>
++
++export class LoyverseConfigError extends Error {
++  constructor(message = 'Loyverse integration is not configured') {
++    super(message)
++    this.name = 'LoyverseConfigError'
++  }
++}
++
++/**
++ * Reads and validates Loyverse-related environment variables on demand.
++ * Throws LoyverseConfigError (never the raw Zod error, which could list
++ * variable names but never their values) if configuration is incomplete.
++ */
++export function getLoyverseEnv(): LoyverseEnv {
++  const parsed = loyverseEnvSchema.safeParse(process.env)
++
++  if (!parsed.success) {
++    const missing = parsed.error.issues.map((issue) => issue.path.join('.')).join(', ')
++    console.error(`Loyverse configuration invalid or incomplete: ${missing}`)
++    throw new LoyverseConfigError(
++      'Loyverse integration is not configured. Check LOYVERSE_* variables against .env.example.',
++    )
++  }
++
++  return parsed.data
++}
+diff --git a/src/lib/integrations/loyverse/oauth-state.ts b/src/lib/integrations/loyverse/oauth-state.ts
+new file mode 100644
+index 0000000..a5b397b
+--- /dev/null
++++ b/src/lib/integrations/loyverse/oauth-state.ts
+@@ -0,0 +1,56 @@
++import 'server-only'
++import { randomBytes } from 'crypto'
++import { cookies } from 'next/headers'
++
++export const OAUTH_STATE_COOKIE = 'loyverse_oauth_state'
++const STATE_MAX_AGE_SECONDS = 10 * 60 // 10 minutes — plenty for a login redirect
++
++interface OAuthStateCookiePayload {
++  nonce: string
++  branchId: string
++}
++
++/**
++ * Generates a random nonce, stores {nonce, branchId} in a short-lived
++ * httpOnly cookie, and returns the nonce to send as the OAuth `state`
++ * query parameter. On callback, compareAndConsumeState() checks the
++ * returned state against the cookie and yields the original branchId —
++ * the branchId is never trusted from the query string itself.
++ */
++export async function createOAuthState(branchId: string): Promise<{ state: string }> {
++  const nonce = randomBytes(32).toString('hex')
++  const payload: OAuthStateCookiePayload = { nonce, branchId }
++
++  const cookieStore = await cookies()
++  cookieStore.set(OAUTH_STATE_COOKIE, JSON.stringify(payload), {
++    httpOnly: true,
++    secure: true,
++    sameSite: 'lax',
++    path: '/',
++    maxAge: STATE_MAX_AGE_SECONDS,
++  })
++
++  return { state: nonce }
++}
++
++export async function compareAndConsumeState(
++  returnedState: string | null,
++): Promise<{ valid: boolean; branchId: string | null }> {
++  const cookieStore = await cookies()
++  const raw = cookieStore.get(OAUTH_STATE_COOKIE)?.value
++  cookieStore.delete(OAUTH_STATE_COOKIE)
++
++  if (!raw || !returnedState) {
++    return { valid: false, branchId: null }
++  }
++
++  try {
++    const payload = JSON.parse(raw) as OAuthStateCookiePayload
++    if (payload.nonce !== returnedState || !payload.branchId) {
++      return { valid: false, branchId: null }
++    }
++    return { valid: true, branchId: payload.branchId }
++  } catch {
++    return { valid: false, branchId: null }
++  }
++}
+diff --git a/src/lib/validation/loyverse.schema.ts b/src/lib/validation/loyverse.schema.ts
+new file mode 100644
+index 0000000..9adba51
+--- /dev/null
++++ b/src/lib/validation/loyverse.schema.ts
+@@ -0,0 +1,13 @@
++import { z } from 'zod'
++
++export const selectLoyverseStoreSchema = z.object({
++  branchId: z.string().min(1, 'Branch is required'),
++  storeId: z.string().min(1, 'Please select a store'),
++  storeName: z.string().min(1, 'Store name is required'),
++})
++
++export type SelectLoyverseStoreInput = z.infer<typeof selectLoyverseStoreSchema>
++
++export function firstZodMessage(error: z.ZodError): string {
++  return error.issues[0]?.message ?? 'Invalid input'
++}
