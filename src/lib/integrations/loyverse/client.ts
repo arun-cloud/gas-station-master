@@ -66,6 +66,9 @@ export class LoyverseApiError extends Error {
 async function requestToken(
   body: URLSearchParams,
 ): Promise<LoyverseTokenResponse> {
+  console.log('Loyverse token request body:', {
+    body: body.toString(),
+  })
   const response = await fetch(LOYVERSE_TOKEN_URL, {
     method: 'POST',
     headers: {
