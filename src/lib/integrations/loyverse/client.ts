@@ -185,33 +185,144 @@ export interface LoyverseStore {
  * real response against your Loyverse app before relying on this in
  * production.
  */
-export async function fetchStores(accessToken: string): Promise<LoyverseStore[]> {
+// export async function fetchStores(accessToken: string): Promise<LoyverseStore[]> {
+//   const response = await fetch(LOYVERSE_STORES_URL, {
+//     headers: { Authorization: `Bearer ${accessToken}` },
+//     cache: 'no-store',
+//   })
+
+//   if (!response.ok) {
+//     console.error(`Loyverse stores request failed: status ${response.status}`)
+//     throw new LoyverseApiError('Failed to fetch stores from Loyverse', response.status)
+//   }
+
+//   const data = (await response.json()) as unknown
+
+//   const rawList = Array.isArray(data)
+//     ? data
+//     : Array.isArray((data as { stores?: unknown })?.stores)
+//       ? (data as { stores: unknown[] }).stores
+//       : null
+
+//   if (!rawList) {
+//     throw new LoyverseApiError('Unexpected response shape from Loyverse stores endpoint', 502)
+//   }
+
+//   return rawList
+//     .filter((item): item is { id: string; name: string } => {
+//       const candidate = item as { id?: unknown; name?: unknown }
+//       return typeof candidate?.id === 'string' && typeof candidate?.name === 'string'
+//     })
+//     .map((store) => ({ id: store.id, name: store.name }))
+// }
+
+export async function fetchStores(
+  accessToken: string,
+): Promise<LoyverseStore[]> {
   const response = await fetch(LOYVERSE_STORES_URL, {
-    headers: { Authorization: `Bearer ${accessToken}` },
+    method: 'GET',
+    headers: {
+      Accept: 'application/json',
+      Authorization: `Bearer ${accessToken}`,
+    },
     cache: 'no-store',
   })
 
-  if (!response.ok) {
-    console.error(`Loyverse stores request failed: status ${response.status}`)
-    throw new LoyverseApiError('Failed to fetch stores from Loyverse', response.status)
+  const rawBody = await response.text()
+  const contentType =
+    response.headers.get('content-type') ?? 'unknown'
+
+  let data: unknown = null
+
+  if (rawBody.trim()) {
+    try {
+      data = JSON.parse(rawBody)
+    } catch {
+      console.error('Loyverse stores returned non-JSON:', {
+        status: response.status,
+        contentType,
+        contentLength: rawBody.length,
+      })
+
+      throw new LoyverseApiError(
+        'Loyverse stores returned an invalid response',
+        response.status || 502,
+      )
+    }
   }
 
-  const data = (await response.json()) as unknown
+  if (!response.ok) {
+    let errorCode = 'unknown_error'
+
+    if (
+      data &&
+      typeof data === 'object' &&
+      'errors' in data &&
+      Array.isArray(data.errors)
+    ) {
+      const firstError = data.errors[0] as
+        | { code?: unknown }
+        | undefined
+
+      if (typeof firstError?.code === 'string') {
+        errorCode = firstError.code
+      }
+    }
+
+    console.error('Loyverse stores request failed:', {
+      status: response.status,
+      statusText: response.statusText,
+      contentType,
+      contentLength: rawBody.length,
+      errorCode,
+    })
+
+    throw new LoyverseApiError(
+      `Failed to fetch stores from Loyverse: ${errorCode}`,
+      response.status,
+    )
+  }
 
   const rawList = Array.isArray(data)
     ? data
-    : Array.isArray((data as { stores?: unknown })?.stores)
-      ? (data as { stores: unknown[] }).stores
+    : data &&
+      typeof data === 'object' &&
+      'stores' in data &&
+      Array.isArray(data.stores)
+      ? data.stores
       : null
 
   if (!rawList) {
-    throw new LoyverseApiError('Unexpected response shape from Loyverse stores endpoint', 502)
+    console.error('Unexpected Loyverse stores response shape:', {
+      status: response.status,
+      contentType,
+      contentLength: rawBody.length,
+    })
+
+    throw new LoyverseApiError(
+      'Unexpected response shape from Loyverse stores endpoint',
+      502,
+    )
   }
 
   return rawList
     .filter((item): item is { id: string; name: string } => {
-      const candidate = item as { id?: unknown; name?: unknown }
-      return typeof candidate?.id === 'string' && typeof candidate?.name === 'string'
+      if (!item || typeof item !== 'object') {
+        return false
+      }
+
+      const candidate = item as {
+        id?: unknown
+        name?: unknown
+      }
+
+      return (
+        typeof candidate.id === 'string' &&
+        typeof candidate.name === 'string'
+      )
     })
-    .map((store) => ({ id: store.id, name: store.name }))
+    .map(store => ({
+      id: store.id,
+      name: store.name,
+    }))
 }

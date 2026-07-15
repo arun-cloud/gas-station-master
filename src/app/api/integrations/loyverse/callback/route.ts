@@ -40,8 +40,52 @@ export async function GET(request: NextRequest) {
     const actor = await requireUserOrThrow()
     await requireBranchAccess(branchId)
 
-    const tokens = await exchangeCodeForToken(code)
-    const stores = await fetchStores(tokens.access_token)
+    // const tokens = await exchangeCodeForToken(code)
+    // const stores = await fetchStores(tokens.access_token)
+
+    let tokens
+
+    try {
+      tokens = await exchangeCodeForToken(code)
+    } catch (error) {
+      if (error instanceof LoyverseApiError) {
+        console.error('Loyverse token exchange failed:', {
+          status: error.status,
+          message: error.message,
+        })
+
+        return redirectToSettings(request, {
+          loyverse: 'failed',
+          error: 'token_exchange_failed',
+          status: String(error.status),
+          branchId,
+        })
+      }
+
+      throw error
+    }
+
+    let stores
+
+    try {
+      stores = await fetchStores(tokens.access_token)
+    } catch (error) {
+      if (error instanceof LoyverseApiError) {
+        console.error('Loyverse stores fetch failed:', {
+          status: error.status,
+          message: error.message,
+        })
+
+        return redirectToSettings(request, {
+          loyverse: 'failed',
+          error: 'stores_fetch_failed',
+          status: String(error.status),
+          branchId,
+        })
+      }
+
+      throw error
+    }
 
     if (stores.length === 0) {
       await upsertConnectionFromTokenResponse({
