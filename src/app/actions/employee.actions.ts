@@ -1,10 +1,11 @@
 'use server'
 
-import { prisma }         from '@/lib/prisma'
-import { revalidatePath }  from 'next/cache'
-import bcrypt              from 'bcryptjs'
+import { prisma } from '@/lib/prisma'
+import { revalidatePath } from 'next/cache'
+import bcrypt from 'bcryptjs'
 import { requireRole, requireUserOrThrow, ForbiddenError } from '@/lib/rbac'
 import type { Role } from '../../../prisma/generated/client'
+import { resolveActiveBranch } from '@/lib/branch-context'
 
 const VALID_ROLES: Role[] = ['ADMIN', 'MANAGER', 'CASHIER']
 
@@ -17,10 +18,10 @@ export async function addEmployee(formData: FormData) {
   try {
     const actor = await requireRole(['ADMIN', 'MANAGER'])
 
-    const name     = formData.get('name')     as string
-    const email    = formData.get('email')    as string
+    const name = formData.get('name') as string
+    const email = formData.get('email') as string
     const password = formData.get('password') as string
-    const role     = formData.get('role')     as string
+    const role = formData.get('role') as string
 
     if (!name || !email || !password || !role) {
       return { success: false, error: 'All fields are required' }
@@ -40,7 +41,7 @@ export async function addEmployee(formData: FormData) {
         name,
         email,
         password: hashed,
-        role:     role as Role,
+        role: role as Role,
         isActive: true,
         createdBy: actor.id,
       },
@@ -66,7 +67,7 @@ export async function toggleEmployeeStatus(
 
     await prisma.user.update({
       where: { id: userId },
-      data:  { isActive, updatedBy: actor.id },
+      data: { isActive, updatedBy: actor.id },
     })
     revalidatePath('/employees')
     return { success: true }
@@ -83,50 +84,81 @@ export async function clockIn(userId: string, openingCash: number) {
   try {
     await requireUserOrThrow()
 
-    // Check no active shift already open
+    const { activeBranch } = await resolveActiveBranch()
+
+    if (!activeBranch) {
+      return {
+        success: false,
+        error: 'No active branch selected',
+      }
+    }
+
+    if (!Number.isFinite(openingCash) || openingCash < 0) {
+      return {
+        success: false,
+        error: 'Opening cash must be zero or greater',
+      }
+    }
+
     const existing = await prisma.shift.findFirst({
-      where: { userId, status: 'ACTIVE' },
+      where: {
+        userId,
+        branchId: activeBranch.id,
+        status: 'ACTIVE',
+      },
     })
+
     if (existing) {
-      return { success: false, error: 'Employee already has an active shift' }
+      return {
+        success: false,
+        error: 'Employee already has an active shift in this branch',
+      }
     }
 
     await prisma.shift.create({
       data: {
         userId,
-        startTime:   new Date(),
+        branchId: activeBranch.id,
+        startTime: new Date(),
         openingCash,
-        status:      'ACTIVE',
+        status: 'ACTIVE',
       },
     })
 
     revalidatePath('/employees')
     revalidatePath('/employees/shifts')
+
     return { success: true }
   } catch (error: unknown) {
     if (error instanceof ForbiddenError) {
       return { success: false, error: error.message }
     }
-    return { success: false, error: 'Failed to clock in' }
+
+    console.error('Clock-in failed:', error)
+
+    return {
+      success: false,
+      error: 'Failed to clock in',
+    }
   }
 }
 
 // ── Clock out ───────────────────────────────────────────
 export async function clockOut(
-  shiftId:     string,
+  shiftId: string,
   closingCash: number,
-  notes:       string
+  notes: string
 ) {
   try {
     await requireUserOrThrow()
 
     await prisma.shift.update({
       where: { id: shiftId },
-      data:  {
-        endTime:     new Date(),
+      data: {
+        endTime: new Date(),
         closingCash,
-        notes:       notes || null,
-        status:      'CLOSED',
+        notes: notes || null,
+        status: 'CLOSED',
       },
     })
 
@@ -144,7 +176,7 @@ export async function clockOut(
 // ── Update employee role ─────────────────────────────────
 export async function updateEmployeeRole(
   userId: string,
-  role:   string
+  role: string
 ) {
   try {
     const actor = await requireRole(['ADMIN'])
@@ -155,7 +187,7 @@ export async function updateEmployeeRole(
 
     await prisma.user.update({
       where: { id: userId },
-      data:  { role: role as Role, updatedBy: actor.id },
+      data: { role: role as Role, updatedBy: actor.id },
     })
     revalidatePath('/employees')
     return { success: true }

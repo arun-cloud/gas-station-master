@@ -1,40 +1,46 @@
 'use client'
 
 import { useState, useTransition } from 'react'
-import { recordDelivery }          from '@/app/actions/fuel.actions'
-import { Plus, X, Truck }          from 'lucide-react'
+import { recordDelivery } from '@/app/actions/fuel.actions'
+import { Plus, X, Truck } from 'lucide-react'
 
 interface Tank {
-  id:       string
+  id: string
   tankNumber: number
   fuelType: string
 }
 
 interface Supplier {
-  id:   string
+  id: string
   name: string
 }
 
+interface PurchaseOrder {
+  id: string
+  orderNumber: string
+}
+
 interface Props {
-  tanks:     Tank[]
+  tanks: Tank[]
   suppliers: Supplier[]
+  purchaseOrders: PurchaseOrder[]
 }
 
 const fuelLabels: Record<string, string> = {
-  PETROL_91:      'Petrol 91',
-  PETROL_95:      'Petrol 95',
-  DIESEL:         'Diesel',
+  PETROL_91: 'Petrol 91',
+  PETROL_95: 'Petrol 95',
+  DIESEL: 'Diesel',
   PREMIUM_DIESEL: 'Premium Diesel',
 }
 
-export default function AddDeliveryForm({ tanks, suppliers }: Props) {
-  const [open, setOpen]              = useState(false)
-  const [error, setError]            = useState('')
+export default function AddDeliveryForm({ tanks, suppliers, purchaseOrders }: Props) {
+  const [open, setOpen] = useState(false)
+  const [error, setError] = useState('')
   const [isPending, startTransition] = useTransition()
 
   // Live total cost preview
-  const [litres, setLitres]   = useState('')
-  const [price,  setPrice]    = useState('')
+  const [litres, setLitres] = useState('')
+  const [price, setPrice] = useState('')
   const totalCost = litres && price
     ? (parseFloat(litres) * parseFloat(price)).toFixed(2)
     : null
@@ -110,6 +116,21 @@ export default function AddDeliveryForm({ tanks, suppliers }: Props) {
                   <option value="">Select supplier</option>
                   {suppliers.map(s => (
                     <option key={s.id} value={s.id}>{s.name}</option>
+                  ))}
+                </select>
+              </div>
+
+              {/* Purchase order selector */}
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">
+                  Purchase Order
+                </label>
+                <select name="purchaseOrderId" required
+                  className="w-full px-3 py-2 border border-gray-300 rounded-lg
+                    text-sm focus:outline-none focus:ring-2 focus:ring-amber-500 bg-white">
+                  <option value="">Select purchase order</option>
+                  {purchaseOrders.map(po => (
+                    <option key={po.id} value={po.id}>{po.orderNumber}</option>
                   ))}
                 </select>
               </div>

@@ -1,67 +1,68 @@
 'use client'
 
 import { useState, useTransition } from 'react'
-import { recordSale }              from '@/app/actions/sales.actions'
-import SaleReceiptModal            from './SaleReceiptModal'
+import { recordSale } from '@/app/actions/sales.actions'
+import SaleReceiptModal from './SaleReceiptModal'
 import { Fuel, CreditCard, Banknote, Star } from 'lucide-react'
 
 interface Pump {
-  id:         string
+  id: string
   pumpNumber: number
-  fuelType:   string
-  status:     string
+  nozzleNumber: number
+  fuelType: string
+  status: string
 }
 
 interface Customer {
-  id:            string
-  name:          string
-  phone:         string
+  id: string
+  name: string
+  phone: string
   loyaltyPoints: number
 }
 
 interface Props {
-  pumps:     Pump[]
+  pumps: Pump[]
   customers: Customer[]
-  userId:    string
+
 }
 
 const fuelLabels: Record<string, string> = {
-  PETROL_91:      'Petrol 91',
-  PETROL_95:      'Petrol 95',
-  DIESEL:         'Diesel',
+  PETROL_91: 'Petrol 91',
+  PETROL_95: 'Petrol 95',
+  DIESEL: 'Diesel',
   PREMIUM_DIESEL: 'Premium Diesel',
 }
 
 const FUEL_PRICES: Record<string, number> = {
-  PETROL_91:      1.25,
-  PETROL_95:      1.45,
-  DIESEL:         0.75,
+  PETROL_91: 1.25,
+  PETROL_95: 1.45,
+  DIESEL: 0.75,
   PREMIUM_DIESEL: 1.75,
 }
 
 const paymentOptions = [
-  { value: 'CASH',           label: 'Cash',           icon: Banknote   },
-  { value: 'CARD',           label: 'Card',           icon: CreditCard },
-  { value: 'LOYALTY_POINTS', label: 'Loyalty Points', icon: Star       },
+  { value: 'CASH', label: 'Cash', icon: Banknote },
+  { value: 'CARD', label: 'Card', icon: CreditCard },
+  { value: 'LOYALTY_POINTS', label: 'Loyalty Points', icon: Star },
 ]
 
-export default function POSTerminal({ pumps, customers, userId }: Props) {
+export default function POSTerminal({ pumps, customers }: Props) {
   // Form state
-  const [selectedPump,    setSelectedPump]    = useState<Pump | null>(null)
-  const [litres,          setLitres]          = useState('')
-  const [paymentMethod,   setPaymentMethod]   = useState('CASH')
-  const [customerSearch,  setCustomerSearch]  = useState('')
+  const [selectedPump, setSelectedPump] = useState<Pump | null>(null)
+  const [litres, setLitres] = useState('')
+  const [paymentMethod, setPaymentMethod] = useState('CASH')
+  const [customerSearch, setCustomerSearch] = useState('')
   const [selectedCustomer, setSelectedCustomer] = useState<Customer | null>(null)
-  const [error,           setError]           = useState('')
-  const [receipt,         setReceipt]         = useState<any>(null)
-  const [isPending,       startTransition]    = useTransition()
+  const [error, setError] = useState('')
+  const [receipt, setReceipt] = useState<any>(null)
+  const [isPending, startTransition] = useTransition()
 
   // Filtered customers for search
   const filteredCustomers = customerSearch.length > 1
     ? customers.filter(c =>
-        c.name.toLowerCase().includes(customerSearch.toLowerCase()) ||
-        c.phone.includes(customerSearch)
-      )
+      c.name.toLowerCase().includes(customerSearch.toLowerCase()) ||
+      c.phone.includes(customerSearch)
+    )
     : []
 
   // Live calculation
@@ -83,10 +84,9 @@ export default function POSTerminal({ pumps, customers, userId }: Props) {
     if (!litres || parseFloat(litres) <= 0) return setError('Enter valid litres')
 
     const formData = new FormData()
-    formData.set('pumpId',        selectedPump.id)
-    formData.set('litres',        litres)
+    formData.set('nozzleId', selectedPump.id)
+    formData.set('litres', litres)
     formData.set('paymentMethod', paymentMethod)
-    formData.set('userId',        userId)
     if (selectedCustomer) formData.set('customerId', selectedCustomer.id)
 
     startTransition(async () => {
@@ -140,6 +140,9 @@ export default function POSTerminal({ pumps, customers, userId }: Props) {
                   >
                     <p className="text-lg font-bold text-gray-800">
                       #{pump.pumpNumber}
+                    </p>
+                    <p className="text-xs text-gray-500">
+                      Nozzle {pump.nozzleNumber}
                     </p>
                     <p className="text-xs text-gray-500 mt-0.5">
                       {fuelLabels[pump.fuelType] ?? pump.fuelType}
@@ -376,7 +379,7 @@ export default function POSTerminal({ pumps, customers, userId }: Props) {
       </form>
 
       {/* Receipt modal */}
-      {receipt && selectedPump === null && (
+      {/* {receipt && selectedPump === null && (
         <SaleReceiptModal
           receipt={receipt}
           pumpNumber={
@@ -385,8 +388,8 @@ export default function POSTerminal({ pumps, customers, userId }: Props) {
           }
           onClose={() => setReceipt(null)}
         />
-      )}
-      {receipt && (
+      )} */}
+      {/* {receipt && (
         <SaleReceiptModal
           receipt={receipt}
           pumpNumber={
@@ -394,6 +397,14 @@ export default function POSTerminal({ pumps, customers, userId }: Props) {
               receipt.pumpId && p.id === receipt.pumpId
             )?.pumpNumber ?? 1
           }
+          onClose={() => setReceipt(null)}
+        />
+      )} */}
+
+      {receipt && (
+        <SaleReceiptModal
+          receipt={receipt}
+          pumpNumber={receipt.dispenserNumber}
           onClose={() => setReceipt(null)}
         />
       )}

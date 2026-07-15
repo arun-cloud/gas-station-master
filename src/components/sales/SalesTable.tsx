@@ -1,28 +1,26 @@
-import { Sale } from '@prisma/client'
-
 interface SaleRow {
-  id:            string
-  fuelType:      string
-  litres:        any
-  pricePerLitre: any
-  totalAmount:   any
+  id: string
+  fuelType: string
+  litres: unknown
+  pricePerLitre: unknown
+  totalAmount: unknown
   paymentMethod: string
-  createdAt:     Date
-  pump:          { pumpNumber: number }
-  user:          { name: string }
-  customer:      { name: string } | null
+  createdAt: Date
+  dispenser: { dispenserNumber: number }
+  user: { name: string }
+  customer: { name: string } | null
 }
 
 const fuelLabels: Record<string, string> = {
-  PETROL_91:      'Petrol 91',
-  PETROL_95:      'Petrol 95',
-  DIESEL:         'Diesel',
+  PETROL_91: 'Petrol 91',
+  PETROL_95: 'Petrol 95',
+  DIESEL: 'Diesel',
   PREMIUM_DIESEL: 'Premium Diesel',
 }
 
 const paymentColors: Record<string, string> = {
-  CASH:           'bg-green-100 text-green-700',
-  CARD:           'bg-blue-100  text-blue-700',
+  CASH: 'bg-green-100 text-green-700',
+  CARD: 'bg-blue-100  text-blue-700',
   LOYALTY_POINTS: 'bg-purple-100 text-purple-700',
 }
 
@@ -42,12 +40,12 @@ export default function SalesTable({ sales }: { sales: SaleRow[] }) {
           <tr className="border-b border-gray-200">
             {['Time', 'Pump', 'Fuel', 'Litres', 'Price/L',
               'Total', 'Payment', 'Cashier', 'Customer'].map(h => (
-              <th key={h}
-                className="text-left text-xs font-medium text-gray-400
+                <th key={h}
+                  className="text-left text-xs font-medium text-gray-400
                   uppercase tracking-wide pb-3 pr-4 whitespace-nowrap">
-                {h}
-              </th>
-            ))}
+                  {h}
+                </th>
+              ))}
           </tr>
         </thead>
         <tbody className="divide-y divide-gray-100">
@@ -59,7 +57,7 @@ export default function SalesTable({ sales }: { sales: SaleRow[] }) {
                 })}
               </td>
               <td className="py-3 pr-4 font-medium text-gray-700">
-                #{sale.pump.pumpNumber}
+                #{sale.dispenser.dispenserNumber}
               </td>
               <td className="py-3 pr-4 text-gray-600">
                 {fuelLabels[sale.fuelType] ?? sale.fuelType}

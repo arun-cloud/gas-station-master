@@ -1,19 +1,52 @@
 'use server'
 
-import { prisma }        from '@/lib/prisma'
+import { prisma } from '@/lib/prisma'
 import { revalidatePath } from 'next/cache'
+
 
 // ── Record a fuel delivery ──────────────────────────────
 export async function recordDelivery(formData: FormData) {
-  const tankId        = formData.get('tankId')        as string
-  const supplierId    = formData.get('supplierId')    as string
-  const litres        = Number(formData.get('litres'))
+  const purchaseOrderId = formData.get('purchaseOrderId')?.toString().trim() ?? ''
+  const tankId = formData.get('tankId') as string
+  const supplierId = formData.get('supplierId') as string
+  const litres = Number(formData.get('litres'))
   const pricePerLitre = Number(formData.get('pricePerLitre'))
-  const notes         = formData.get('notes')         as string
+  const notes = formData.get('notes') as string
 
-  if (!tankId || !supplierId || !litres || !pricePerLitre) {
-    return { success: false, error: 'All fields are required' }
+
+  if (
+    !tankId ||
+    !supplierId ||
+    !purchaseOrderId ||
+    !Number.isFinite(litres) ||
+    !Number.isFinite(pricePerLitre)
+  ) {
+    return {
+      success: false,
+      error: 'Tank, supplier, purchase order, litres and price are required',
+    }
   }
+
+  const purchaseOrder = await prisma.purchaseOrder.findFirst({
+    where: {
+      id: purchaseOrderId,
+      supplierId,
+      status: {
+        in: ['PENDING', 'CONFIRMED'],
+      },
+    },
+    select: {
+      id: true,
+    },
+  })
+
+  if (!purchaseOrder) {
+    return {
+      success: false,
+      error: 'Invalid purchase order for the selected supplier',
+    }
+  }
+
 
   if (litres <= 0 || pricePerLitre <= 0) {
     return { success: false, error: 'Litres and price must be positive' }
@@ -40,6 +73,7 @@ export async function recordDelivery(formData: FormData) {
         data: {
           tankId,
           supplierId,
+          purchaseOrderId,
           litresDelivered: litres,
           pricePerLitre,
           notes: notes || null,
@@ -47,7 +81,7 @@ export async function recordDelivery(formData: FormData) {
       }),
       prisma.fuelTank.update({
         where: { id: tankId },
-        data:  { currentLevel: newLevel },
+        data: { currentLevel: newLevel },
       }),
     ])
 
@@ -74,7 +108,7 @@ export async function adjustTankLevel(
 
     await prisma.fuelTank.update({
       where: { id: tankId },
-      data:  { currentLevel: newLevel },
+      data: { currentLevel: newLevel },
     })
 
     revalidatePath('/fuel')
@@ -93,7 +127,7 @@ export async function updateMinLevel(
   try {
     await prisma.fuelTank.update({
       where: { id: tankId },
-      data:  { minLevel },
+      data: { minLevel },
     })
 
     revalidatePath('/fuel')
@@ -101,5 +135,26 @@ export async function updateMinLevel(
     return { success: true }
   } catch (error) {
     return { success: false, error: 'Failed to update minimum level' }
+  }
+}
+
+// ── Fetch pending purchase orders for a supplier ────────
+export async function getPendingPurchaseOrders(supplierId: string) {
+  try {
+    const orders = await prisma.purchaseOrder.findMany({
+      where: {
+        supplierId,
+        status: {
+          in: ['PENDING', 'CONFIRMED'],
+        },
+      },
+      select: {
+        id: true,
+        orderNumber: true,
+      },
+    })
+    return { success: true, orders }
+  } catch (error) {
+    return { success: false, error: 'Failed to fetch purchase orders' }
   }
 }

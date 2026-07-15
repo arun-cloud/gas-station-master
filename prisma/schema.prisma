@@ -233,6 +233,7 @@ model FuelDelivery {
 
 model PurchaseOrder {
   id           String   @id @default(cuid())
+  orderNumber  String   @unique
   supplierId   String
   status       POStatus @default(PENDING)
   totalAmount  Decimal
