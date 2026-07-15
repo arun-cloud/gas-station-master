@@ -12,7 +12,7 @@ import { getLoyverseEnv } from './env'
 
 const LOYVERSE_AUTHORIZE_URL = 'https://api.loyverse.com/oauth/authorize'
 const LOYVERSE_TOKEN_URL = 'https://api.loyverse.com/oauth/token'
-const LOYVERSE_STORES_URL = 'https://api.loyverse.com/v1/stores'
+const LOYVERSE_STORES_URL = 'https://api.loyverse.com/v1.0/stores'
 
 // Minimum scopes needed for Phase 3B (receipt sync) plus store/employee
 // context. Kept identical to what was already requested by the existing
@@ -63,25 +63,85 @@ export class LoyverseApiError extends Error {
   }
 }
 
-async function requestToken(body: URLSearchParams): Promise<LoyverseTokenResponse> {
+async function requestToken(
+  body: URLSearchParams,
+): Promise<LoyverseTokenResponse> {
   const response = await fetch(LOYVERSE_TOKEN_URL, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body,
+    headers: {
+      Accept: 'application/json',
+      'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+    },
+    body: body.toString(),
     cache: 'no-store',
+
+    // Prevent fetch from silently following an unexpected redirect and
+    // turning the useful upstream response into something mysterious.
+    redirect: 'manual',
   })
 
-  const data = (await response.json()) as LoyverseTokenResponse | LoyverseTokenErrorResponse
+  const rawBody = await response.text()
+  const contentType =
+    response.headers.get('content-type') ?? 'unknown'
 
-  if (!response.ok || !('access_token' in data) || !data.access_token) {
-    // Log only the error code, never the full response (which could echo
-    // back client secrets or partial tokens on some providers).
-    const errorCode = 'error' in data ? data.error : 'unknown_error'
-    console.error(`Loyverse token request failed: ${errorCode ?? 'unknown_error'} (status ${response.status})`)
-    throw new LoyverseApiError('Failed to obtain a token from Loyverse', response.status)
+  let data:
+    | LoyverseTokenResponse
+    | LoyverseTokenErrorResponse
+    | null = null
+
+  if (rawBody.trim()) {
+    try {
+      data = JSON.parse(rawBody) as
+        | LoyverseTokenResponse
+        | LoyverseTokenErrorResponse
+    } catch {
+      data = null
+    }
   }
 
-  return data
+  const hasAccessToken =
+    data !== null &&
+    'access_token' in data &&
+    typeof data.access_token === 'string' &&
+    data.access_token.length > 0
+
+  if (!response.ok || !hasAccessToken) {
+    const errorCode =
+      data &&
+        'error' in data &&
+        typeof data.error === 'string'
+        ? data.error
+        : rawBody.trim()
+          ? 'invalid_or_non_json_response'
+          : 'empty_response'
+
+    const redirectLocation = response.headers.get('location')
+
+    /*
+     * Safe diagnostics only:
+     * - Do not log request body
+     * - Do not log authorization code
+     * - Do not log client secret
+     * - Do not log token response body
+     */
+    console.error('Loyverse token request failed:', {
+      status: response.status,
+      statusText: response.statusText,
+      contentType,
+      contentLength: rawBody.length,
+      errorCode,
+      redirectLocation: redirectLocation
+        ? new URL(redirectLocation, LOYVERSE_TOKEN_URL).origin
+        : null,
+    })
+
+    throw new LoyverseApiError(
+      `Failed to obtain a token from Loyverse: ${errorCode}`,
+      response.status || 502,
+    )
+  }
+
+  return data as LoyverseTokenResponse
 }
 
 export function exchangeCodeForToken(code: string): Promise<LoyverseTokenResponse> {
