@@ -516,10 +516,10 @@ index 0000000..6bf53eb
 +  }
 +}
 diff --git a/src/app/api/integrations/loyverse/callback/route.ts b/src/app/api/integrations/loyverse/callback/route.ts
-index fe39b9c..d2b759a 100644
+index fe39b9c..6b734f6 100644
 --- a/src/app/api/integrations/loyverse/callback/route.ts
 +++ b/src/app/api/integrations/loyverse/callback/route.ts
-@@ -1,105 +1,90 @@
+@@ -1,105 +1,97 @@
 -import { NextRequest, NextResponse } from "next/server";
 -
 -interface LoyverseTokenResponse {
@@ -531,6 +531,7 @@ index fe39b9c..d2b759a 100644
 -    error?: string;
 -    error_description?: string;
 +import { NextRequest, NextResponse } from 'next/server'
++import { prisma } from '@/lib/prisma'
 +import { requireBranchAccess, requireUserOrThrow, ForbiddenError } from '@/lib/rbac'
 +import { exchangeCodeForToken, fetchStores, LoyverseApiError } from '@/lib/integrations/loyverse/client'
 +import { compareAndConsumeState } from '@/lib/integrations/loyverse/oauth-state'
@@ -583,35 +584,56 @@ index fe39b9c..d2b759a 100644
 +    await requireBranchAccess(branchId)
 +
 +    const tokens = await exchangeCodeForToken(code)
-+    const stores = await fetchStores(tokens.access_token)
 +
-+    if (stores.length === 0) {
-+      await upsertConnectionFromTokenResponse({
-+        branchId,
-+        tokens,
-+        actorId: actor.id,
-+        status: 'ERROR',
-+      })
-+      return redirectToSettings(request, { loyverse: 'failed', error: 'no_stores_found', branchId })
++    // Persist immediately — a successfully-exchanged token must never be
++    // thrown away, even if the store-resolution step below fails (e.g. an
++    // unexpected response shape from Loyverse). Worst case, it sits as
++    // PENDING_STORE_SELECTION and the Settings page retries store lookup
++    // on every render, with no need to redo the OAuth handshake.
++    await upsertConnectionFromTokenResponse({
++      branchId,
++      tokens,
++      actorId: actor.id,
++      status: 'PENDING_STORE_SELECTION',
++    })
++
++    try {
++      const stores = await fetchStores(tokens.access_token)
++
++      if (stores.length === 1) {
++        await prisma.loyverseConnection.update({
++          where: { branchId },
++          data: {
++            status: 'CONNECTED',
++            storeId: stores[0].id,
++            storeName: stores[0].name,
++            updatedBy: actor.id,
++          },
++        })
++        return redirectToSettings(request, { loyverse: 'connected', branchId })
++      }
++
++      // 0 or 2+ stores: leave as PENDING_STORE_SELECTION either way — the
++      // Settings page shows the picker (or a friendly "none found, retry"
++      // state) and re-fetches the store list on every render.
++      return redirectToSettings(request, { loyverse: 'select-store', branchId })
++    } catch (storeError) {
++      // Token is already safely persisted — just log and let the Settings
++      // page's own fetchStores retry handle recovery.
++      console.error(`Loyverse store lookup failed for branch ${branchId}:`, storeError)
++      return redirectToSettings(request, { loyverse: 'select-store', branchId })
      }
- 
+-
 -    if (!code) {
 -        return NextResponse.json(
 -            { error: "Loyverse authorization code is missing" },
 -            { status: 400 }
 -        );
-+    if (stores.length === 1) {
-+      await upsertConnectionFromTokenResponse({
-+        branchId,
-+        tokens,
-+        actorId: actor.id,
-+        status: 'CONNECTED',
-+        storeId: stores[0].id,
-+        storeName: stores[0].name,
-+      })
-+      return redirectToSettings(request, { loyverse: 'connected', branchId })
++  } catch (error) {
++    if (error instanceof ForbiddenError) {
++      return redirectToSettings(request, { loyverse: 'failed', error: 'forbidden', branchId })
      }
- 
+-
 -    const savedState = request.cookies.get("loyverse_oauth_state")?.value;
 -
 -    if (!savedState || !returnedState || savedState !== returnedState) {
@@ -619,18 +641,8 @@ index fe39b9c..d2b759a 100644
 -            { error: "Invalid OAuth state" },
 -            { status: 400 }
 -        );
-+    // Multiple stores visible to this merchant — persist the tokens now,
-+    // but require an explicit choice before treating the connection as live.
-+    await upsertConnectionFromTokenResponse({
-+      branchId,
-+      tokens,
-+      actorId: actor.id,
-+      status: 'PENDING_STORE_SELECTION',
-+    })
-+    return redirectToSettings(request, { loyverse: 'select-store', branchId })
-+  } catch (error) {
-+    if (error instanceof ForbiddenError) {
-+      return redirectToSettings(request, { loyverse: 'failed', error: 'forbidden', branchId })
++    if (error instanceof LoyverseConfigError) {
++      return redirectToSettings(request, { loyverse: 'failed', error: 'not_configured', branchId })
      }
 -
 -    const clientId = process.env.LOYVERSE_CLIENT_ID;
@@ -642,8 +654,9 @@ index fe39b9c..d2b759a 100644
 -            { error: "Loyverse OAuth configuration is incomplete" },
 -            { status: 500 }
 -        );
-+    if (error instanceof LoyverseConfigError) {
-+      return redirectToSettings(request, { loyverse: 'failed', error: 'not_configured', branchId })
++    if (error instanceof LoyverseApiError) {
++      console.error('Loyverse callback API error:', error.message, error.status)
++      return redirectToSettings(request, { loyverse: 'failed', error: 'provider_error', branchId })
      }
 -
 -    const tokenResponse = await fetch(
@@ -677,10 +690,7 @@ index fe39b9c..d2b759a 100644
 -            },
 -            { status: tokenResponse.status }
 -        );
-+    if (error instanceof LoyverseApiError) {
-+      console.error('Loyverse callback API error:', error.message, error.status)
-+      return redirectToSettings(request, { loyverse: 'failed', error: 'provider_error', branchId })
-     }
+-    }
 -
 -    /*
 -     * Save these securely in your database:
@@ -796,10 +806,10 @@ index ce04fd2..21b4cb9 100644
 +}
 diff --git a/src/components/settings/LoyverseIntegrationCard.tsx b/src/components/settings/LoyverseIntegrationCard.tsx
 new file mode 100644
-index 0000000..c3ca22f
+index 0000000..d99a86a
 --- /dev/null
 +++ b/src/components/settings/LoyverseIntegrationCard.tsx
-@@ -0,0 +1,231 @@
+@@ -0,0 +1,242 @@
 +'use client'
 +
 +import { useState, useTransition } from 'react'
@@ -993,9 +1003,20 @@ index 0000000..c3ca22f
 +            This Loyverse account has multiple stores. Choose the one that matches this branch.
 +          </p>
 +          {availableStores.length === 0 ? (
-+            <p className="text-sm text-amber-700">
-+              Couldn&apos;t load the store list — try reconnecting.
-+            </p>
++            <div className="space-y-2">
++              <p className="text-sm text-amber-700">
++                Couldn&apos;t load the store list just now. Your connection is still saved — try
++                refreshing before reconnecting from scratch.
++              </p>
++              <button
++                type="button"
++                onClick={() => window.location.reload()}
++                className="inline-flex items-center gap-2 rounded-lg border border-amber-300 bg-white px-3 py-1.5 text-sm font-medium text-amber-800 hover:bg-amber-100"
++              >
++                <RefreshCw size={14} />
++                Retry
++              </button>
++            </div>
 +          ) : (
 +            <form onSubmit={handleSelectStore} className="space-y-3">
 +              <div className="space-y-2">
@@ -1033,10 +1054,10 @@ index 0000000..c3ca22f
 +}
 diff --git a/src/lib/integrations/loyverse/client.ts b/src/lib/integrations/loyverse/client.ts
 new file mode 100644
-index 0000000..0be2673
+index 0000000..0e7924c
 --- /dev/null
 +++ b/src/lib/integrations/loyverse/client.ts
-@@ -0,0 +1,157 @@
+@@ -0,0 +1,221 @@
 +import 'server-only'
 +import { getLoyverseEnv } from './env'
 +
@@ -1096,6 +1117,7 @@ index 0000000..0be2673
 +  constructor(
 +    message: string,
 +    public readonly status: number,
++    public readonly errorCode?: string,
 +  ) {
 +    super(message)
 +    this.name = 'LoyverseApiError'
@@ -1105,19 +1127,58 @@ index 0000000..0be2673
 +async function requestToken(body: URLSearchParams): Promise<LoyverseTokenResponse> {
 +  const response = await fetch(LOYVERSE_TOKEN_URL, {
 +    method: 'POST',
-+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
++    headers: {
++      'Content-Type': 'application/x-www-form-urlencoded',
++      // Some gateways/WAFs fall back to an HTML error/challenge page when a
++      // request doesn't explicitly ask for JSON — be unambiguous.
++      Accept: 'application/json',
++      'User-Agent': 'gas-station-ms/1.0 (+loyverse-integration)',
++    },
 +    body,
 +    cache: 'no-store',
 +  })
 +
-+  const data = (await response.json()) as LoyverseTokenResponse | LoyverseTokenErrorResponse
++  // Read as text first — never call .json() blindly. An empty or
++  // non-JSON body (seen in practice: 202 Accepted, 0-byte text/html) would
++  // otherwise throw a raw SyntaxError before any of our error handling runs.
++  const rawText = await response.text()
++
++  // NEVER log `body` here — it contains client_secret and the auth code.
++  // Only status/content metadata is safe to log.
++  const diagnostics = {
++    status: response.status,
++    statusText: response.statusText,
++    contentType: response.headers.get('content-type'),
++    contentLength: rawText.length,
++  }
++
++  if (!rawText) {
++    console.error('Loyverse token request returned an empty body:', diagnostics)
++    throw new LoyverseApiError(
++      'Loyverse returned an empty response instead of a token',
++      response.status,
++      'empty_response',
++    )
++  }
++
++  let data: LoyverseTokenResponse | LoyverseTokenErrorResponse
++  try {
++    data = JSON.parse(rawText)
++  } catch {
++    console.error('Loyverse token request returned a non-JSON body:', diagnostics)
++    throw new LoyverseApiError(
++      'Loyverse returned an unparseable response instead of a token',
++      response.status,
++      'invalid_json',
++    )
++  }
 +
 +  if (!response.ok || !('access_token' in data) || !data.access_token) {
-+    // Log only the error code, never the full response (which could echo
-+    // back client secrets or partial tokens on some providers).
-+    const errorCode = 'error' in data ? data.error : 'unknown_error'
-+    console.error(`Loyverse token request failed: ${errorCode ?? 'unknown_error'} (status ${response.status})`)
-+    throw new LoyverseApiError('Failed to obtain a token from Loyverse', response.status)
++    const errorCode = 'error' in data ? data.error : undefined
++    console.error(
++      `Loyverse token request failed: ${errorCode ?? 'unknown_error'} (status ${response.status})`,
++    )
++    throw new LoyverseApiError('Failed to obtain a token from Loyverse', response.status, errorCode)
 +  }
 +
 +  return data
@@ -1166,16 +1227,40 @@ index 0000000..0be2673
 + */
 +export async function fetchStores(accessToken: string): Promise<LoyverseStore[]> {
 +  const response = await fetch(LOYVERSE_STORES_URL, {
-+    headers: { Authorization: `Bearer ${accessToken}` },
++    headers: {
++      Authorization: `Bearer ${accessToken}`,
++      Accept: 'application/json',
++      'User-Agent': 'gas-station-ms/1.0 (+loyverse-integration)',
++    },
 +    cache: 'no-store',
 +  })
 +
++  const rawText = await response.text()
++
 +  if (!response.ok) {
-+    console.error(`Loyverse stores request failed: status ${response.status}`)
++    console.error('Loyverse stores request failed:', {
++      status: response.status,
++      contentType: response.headers.get('content-type'),
++      contentLength: rawText.length,
++    })
 +    throw new LoyverseApiError('Failed to fetch stores from Loyverse', response.status)
 +  }
 +
-+  const data = (await response.json()) as unknown
++  if (!rawText) {
++    throw new LoyverseApiError('Loyverse returned an empty stores response', response.status, 'empty_response')
++  }
++
++  let data: unknown
++  try {
++    data = JSON.parse(rawText)
++  } catch {
++    console.error('Loyverse stores request returned a non-JSON body:', {
++      status: response.status,
++      contentType: response.headers.get('content-type'),
++      contentLength: rawText.length,
++    })
++    throw new LoyverseApiError('Loyverse returned an unparseable stores response', response.status, 'invalid_json')
++  }
 +
 +  const rawList = Array.isArray(data)
 +    ? data
