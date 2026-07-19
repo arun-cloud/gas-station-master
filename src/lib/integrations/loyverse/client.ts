@@ -6,13 +6,22 @@ import { getLoyverseEnv } from './env'
 //   - Authorize:    GET  https://api.loyverse.com/oauth/authorize
 //   - Token/Refresh:POST https://api.loyverse.com/oauth/token
 //   - Stores:       GET  https://api.loyverse.com/v1.0/stores
-// No webhook subscription or receipt endpoints are called in this phase —
-// those belong to Phase 3B and will be verified against the live developer
-// dashboard before implementation, per the "don't invent endpoints" rule.
+//   - Receipts:     GET  https://api.loyverse.com/v1.0/receipts
+//     Supports store_id, created_at_min/max, updated_at_min/max and
+//     cursor-based pagination (limit + cursor). Used for Phase 3B pull
+//     sync — polling only. Loyverse also offers webhooks for receipts,
+//     configured from their Back Office UI, but the exact payload shape
+//     and signature-verification scheme could not be confirmed from the
+//     live docs at implementation time, so no webhook receiver is wired
+//     up yet (see sync.ts header comment).
+//   - Loyverse does not support editing an already-processed receipt via
+//     the API, which is why Invoice records synced from Loyverse are
+//     treated as view-only in this app.
 
 const LOYVERSE_AUTHORIZE_URL = 'https://api.loyverse.com/oauth/authorize'
 const LOYVERSE_TOKEN_URL = 'https://api.loyverse.com/oauth/token'
 const LOYVERSE_STORES_URL = 'https://api.loyverse.com/v1.0/stores'
+const LOYVERSE_RECEIPTS_URL = 'https://api.loyverse.com/v1.0/receipts'
 
 // Maximum number of retries for the token endpoint when AWS WAF returns a
 // 202 "challenge" response. We pause briefly between attempts so the WAF
@@ -404,4 +413,129 @@ export async function fetchStores(
       id: store.id,
       name: store.name,
     }))
+}
+
+// ─── Receipts (Phase 3B) ─────────────────────────────────────────────
+
+export interface LoyverseReceiptLineItem {
+  id?: string
+  variant_id?: string
+  item_name?: string
+  variant_name?: string
+  sku?: string
+  quantity: number
+  price: number
+  cost?: number
+  line_note?: string
+  gross_total_money?: number
+  total_money?: number
+}
+
+export interface LoyverseReceiptPayment {
+  payment_type_id?: string
+  name?: string
+  money_amount: number
+  paid_at?: string
+}
+
+export interface LoyverseReceipt {
+  receipt_number: string
+  store_id: string
+  order?: string
+  pos_device_id?: string
+  employee_id?: string
+  customer_id?: string
+  receipt_type?: string // SALE | REFUND
+  refund_for?: string
+  receipt_date: string
+  cancelled_at?: string | null
+  total_money: number
+  total_tax?: number
+  total_discount?: number
+  line_items: LoyverseReceiptLineItem[]
+  payments: LoyverseReceiptPayment[]
+}
+
+export interface FetchReceiptsPageParams {
+  accessToken: string
+  storeId: string
+  updatedAtMin?: string
+  cursor?: string
+  limit?: number
+}
+
+export interface FetchReceiptsPageResult {
+  receipts: LoyverseReceipt[]
+  cursor: string | null
+}
+
+/**
+ * Fetches a single page of receipts for a store, newest sync watermark
+ * first. The caller is responsible for following `cursor` until it comes
+ * back null to drain a full page set — see the pagination loop inside
+ * `syncReceiptsForBranch` in sync.ts.
+ */
+export async function fetchReceiptsPage(
+  params: FetchReceiptsPageParams,
+): Promise<FetchReceiptsPageResult> {
+  const { accessToken, storeId, updatedAtMin, cursor, limit = 250 } = params
+
+  const url = new URL(LOYVERSE_RECEIPTS_URL)
+  url.searchParams.set('store_id', storeId)
+  url.searchParams.set('limit', String(limit))
+  if (updatedAtMin) url.searchParams.set('updated_at_min', updatedAtMin)
+  if (cursor) url.searchParams.set('cursor', cursor)
+
+  const response = await fetch(url.toString(), {
+    method: 'GET',
+    headers: buildApiHeaders(accessToken),
+    cache: 'no-store',
+  })
+
+  const rawBody = await response.text()
+  const contentType = response.headers.get('content-type') ?? 'unknown'
+
+  let data: unknown = null
+  if (rawBody.trim()) {
+    try {
+      data = JSON.parse(rawBody)
+    } catch {
+      console.error('[Loyverse] Receipts returned non-JSON:', {
+        status: response.status,
+        contentType,
+        contentLength: rawBody.length,
+      })
+      throw new LoyverseApiError('Loyverse receipts returned an invalid response', response.status || 502)
+    }
+  }
+
+  if (!response.ok) {
+    let errorCode = 'unknown_error'
+    if (data && typeof data === 'object' && 'errors' in data && Array.isArray(data.errors)) {
+      const firstError = data.errors[0] as { code?: unknown } | undefined
+      if (typeof firstError?.code === 'string') errorCode = firstError.code
+    }
+
+    console.error('[Loyverse] Receipts request failed:', {
+      status: response.status,
+      statusText: response.statusText,
+      contentType,
+      contentLength: rawBody.length,
+      errorCode,
+    })
+
+    throw new LoyverseApiError(`Failed to fetch receipts from Loyverse: ${errorCode}`, response.status)
+  }
+
+  const receipts =
+    data && typeof data === 'object' && 'receipts' in data && Array.isArray(data.receipts)
+      ? (data.receipts as LoyverseReceipt[])
+      : []
+
+  const nextCursor =
+    data && typeof data === 'object' && 'cursor' in data && typeof data.cursor === 'string'
+      ? data.cursor
+      : null
+
+  return { receipts, cursor: nextCursor }
 }

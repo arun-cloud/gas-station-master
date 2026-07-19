@@ -18,6 +18,7 @@ import {
   ShieldCheck,
   Building2,
   LogOut,
+  Receipt,
 } from 'lucide-react'
 
 type Role = 'ADMIN' | 'MANAGER' | 'CASHIER'
@@ -33,6 +34,7 @@ const navItems = [
   { label: 'Inventory', href: '/fuel', icon: Gauge },
   { label: 'New Sale', href: '/sales/new', icon: Plus },
   { label: 'Sales Log', href: '/sales', icon: ShoppingCart },
+  { label: 'Invoices', href: '/invoices', icon: Receipt },
   { label: 'Employees', href: '/employees', icon: Users },
   { label: 'Shift History', href: '/employees/shifts', icon: Clock },
   { label: 'Suppliers', href: '/suppliers', icon: Truck },

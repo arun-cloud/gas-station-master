@@ -103,6 +103,7 @@ model Branch {
   shifts       Shift[]
 
   loyverseConnection LoyverseConnection?
+  invoices           Invoice[]
 
   isActive Boolean @default(true)
 
@@ -357,6 +358,12 @@ model LoyverseConnection {
   // Short, non-sensitive error summary only (never raw provider payloads).
   lastError       String?
 
+  // ── Receipt sync (Phase 3B) ──
+  // Watermark used as `updated_at_min` on the next poll — never rewound,
+  // only advanced after a page of receipts has been durably upserted.
+  lastReceiptSyncedAt DateTime?
+  lastReceiptSyncError String?
+
   // Audit: who initiated/last modified this connection
   createdBy String?
   updatedBy String?
@@ -366,4 +373,107 @@ model LoyverseConnection {
 
   @@unique([storeId])
   @@index([status])
+}
+
+// ─── Invoices (Phase 3B: receipt sync + Phase 4: invoice screens) ────
+// An Invoice mirrors one Loyverse "receipt". It is intentionally a
+// separate model from the legacy `Sale` model above: `Sale` is this app's
+// own internal pump-side POS record, while `Invoice` is a read-through
+// copy of a document that lives authoritatively in Loyverse. Loyverse does
+// not allow editing an already-processed receipt via its API, so
+// `Invoice` is a synced, view-only record — never a source of truth we
+// write back from.
+enum InvoiceSource {
+  LOYVERSE
+}
+
+enum InvoiceSyncStatus {
+  SYNCED
+  ERROR
+}
+
+model Invoice {
+  id String @id @default(cuid())
+
+  branchId String
+  branch   Branch @relation(fields: [branchId], references: [id])
+
+  source InvoiceSource @default(LOYVERSE)
+
+  // Loyverse identity. `receiptNumber` is the natural key used for
+  // idempotent upserts — the same receipt can never be inserted twice.
+  loyverseReceiptNumber String
+  loyverseStoreId       String
+  loyverseOrder         String?
+  loyversePosDeviceId   String?
+  loyverseEmployeeId    String?
+  loyverseCustomerId    String?
+  receiptType           String  @default("SALE") // SALE | REFUND, as reported by Loyverse
+  refundFor             String? // receiptNumber of the original sale, if this is a refund
+
+  receiptDate DateTime
+  currency    String   @default("SAR")
+
+  totalMoney    Decimal @db.Decimal(18, 2)
+  totalTax      Decimal @default(0) @db.Decimal(18, 2)
+  totalDiscount Decimal @default(0) @db.Decimal(18, 2)
+  totalPaid     Decimal @default(0) @db.Decimal(18, 2)
+  cancelled     Boolean @default(false)
+
+  syncStatus         InvoiceSyncStatus @default(SYNCED)
+  lastSyncedAt       DateTime          @default(now())
+  lastSyncError      String?
+  // Full receipt payload as returned by Loyverse — kept for audit/debug
+  // and so re-mapping logic can evolve without re-fetching history.
+  rawPayload         Json?
+
+  isActive Boolean @default(true)
+
+  createdBy String?
+  updatedBy String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  lineItems InvoiceLineItem[]
+  payments  InvoicePayment[]
+
+  @@unique([branchId, loyverseReceiptNumber])
+  @@index([branchId, receiptDate])
+  @@index([branchId, isActive])
+  @@index([syncStatus])
+}
+
+model InvoiceLineItem {
+  id        String  @id @default(cuid())
+  invoiceId String
+  invoice   Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  loyverseLineItemId String?
+  loyverseVariantId  String?
+  itemName           String
+  sku                String?
+  quantity           Decimal @db.Decimal(18, 3)
+  price              Decimal @db.Decimal(18, 2)
+  cost               Decimal? @db.Decimal(18, 2)
+  lineNote           String?
+  grossTotal         Decimal @db.Decimal(18, 2)
+
+  createdAt DateTime @default(now())
+
+  @@index([invoiceId])
+}
+
+model InvoicePayment {
+  id        String  @id @default(cuid())
+  invoiceId String
+  invoice   Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  loyversePaymentTypeId String?
+  paymentTypeName       String?
+  moneyAmount           Decimal   @db.Decimal(18, 2)
+  paidAt                DateTime?
+
+  createdAt DateTime @default(now())
+
+  @@index([invoiceId])
 }

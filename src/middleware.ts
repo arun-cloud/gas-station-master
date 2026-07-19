@@ -27,6 +27,7 @@ export const config = {
     '/dispensers/:path*',
     '/fuel/:path*',
     '/sales/:path*',
+    '/invoices/:path*',
     '/employees/:path*',
     '/suppliers/:path*',
     '/reports/:path*',

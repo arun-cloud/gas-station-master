@@ -1,0 +1,1860 @@
+diff --git a/.env.example b/.env.example
+index 3c8ec7f..39bb399 100644
+--- a/.env.example
++++ b/.env.example
+@@ -25,3 +25,13 @@ LOYVERSE_REDIRECT_URI="https://replace-with-your-public-app-url.example.com/api/
+ # Generate with: openssl rand -base64 32
+ # Used to AES-256-GCM encrypt Loyverse access/refresh tokens at rest.
+ LOYVERSE_TOKEN_ENCRYPTION_KEY="replace-with-a-generated-base64-32-byte-key"
++
++# ── Loyverse (Phase 3B: receipt sync) ────────────────────
++# Cron expression for the in-process receipt-sync scheduler (started from
++# src/instrumentation.ts). Defaults to every 5 minutes if unset.
++LOYVERSE_SYNC_CRON="*/5 * * * *"
++# Optional: only needed if you prefer triggering sync from an external
++# cron/orchestrator instead of the in-process scheduler above, by calling
++# POST /api/integrations/loyverse/sync-cron with this as a Bearer token.
++# Generate with: openssl rand -base64 32
++CRON_SECRET="replace-with-a-generated-secret-or-leave-unset"
+diff --git a/package-lock.json b/package-lock.json
+index a856d2f..bc904f4 100644
+--- a/package-lock.json
++++ b/package-lock.json
+@@ -16,6 +16,7 @@
+         "lucide-react": "^1.6.0",
+         "next": "16.2.1",
+         "next-auth": "^4.24.13",
++        "node-cron": "^3.0.3",
+         "pg": "^8.20.0",
+         "prisma": "^7.5.0",
+         "react": "19.2.4",
+@@ -29,6 +30,7 @@
+         "@tailwindcss/postcss": "^4",
+         "@types/bcryptjs": "^2.4.6",
+         "@types/node": "^20",
++        "@types/node-cron": "^3.0.11",
+         "@types/react": "^19",
+         "@types/react-dom": "^19",
+         "eslint": "^9",
+@@ -2579,6 +2581,13 @@
+         "undici-types": "~6.21.0"
+       }
+     },
++    "node_modules/@types/node-cron": {
++      "version": "3.0.11",
++      "resolved": "https://registry.npmjs.org/@types/node-cron/-/node-cron-3.0.11.tgz",
++      "integrity": "sha512-0ikrnug3/IyneSHqCBeslAhlK2aBfYek1fGo4bP4QnZPmiqSGRK+Oy7ZMisLWkesffJvQ1cqAcBnJC+8+nxIAg==",
++      "dev": true,
++      "license": "MIT"
++    },
+     "node_modules/@types/pg": {
+       "version": "8.11.11",
+       "resolved": "https://registry.npmjs.org/@types/pg/-/pg-8.11.11.tgz",
+@@ -6740,6 +6749,18 @@
+         "node": "^10 || ^12 || >=14"
+       }
+     },
++    "node_modules/node-cron": {
++      "version": "3.0.3",
++      "resolved": "https://registry.npmjs.org/node-cron/-/node-cron-3.0.3.tgz",
++      "integrity": "sha512-dOal67//nohNgYWb+nWmg5dkFdIwDm8EpeGYMekPMrngV3637lqnX0lbUcCtgibHTz6SEz7DAIjKvKDFYCnO1A==",
++      "license": "ISC",
++      "dependencies": {
++        "uuid": "8.3.2"
++      },
++      "engines": {
++        "node": ">=6.0.0"
++      }
++    },
+     "node_modules/node-exports-info": {
+       "version": "1.6.0",
+       "resolved": "https://registry.npmjs.org/node-exports-info/-/node-exports-info-1.6.0.tgz",
+diff --git a/package.json b/package.json
+index c35bef4..4b58cd7 100644
+--- a/package.json
++++ b/package.json
+@@ -17,6 +17,7 @@
+     "lucide-react": "^1.6.0",
+     "next": "16.2.1",
+     "next-auth": "^4.24.13",
++    "node-cron": "^3.0.3",
+     "pg": "^8.20.0",
+     "prisma": "^7.5.0",
+     "react": "19.2.4",
+@@ -30,6 +31,7 @@
+     "@tailwindcss/postcss": "^4",
+     "@types/bcryptjs": "^2.4.6",
+     "@types/node": "^20",
++    "@types/node-cron": "^3.0.11",
+     "@types/react": "^19",
+     "@types/react-dom": "^19",
+     "eslint": "^9",
+diff --git a/prisma/migrations/20260719120000_add_invoices/migration.sql b/prisma/migrations/20260719120000_add_invoices/migration.sql
+new file mode 100644
+index 0000000..2f48ff7
+--- /dev/null
++++ b/prisma/migrations/20260719120000_add_invoices/migration.sql
+@@ -0,0 +1,122 @@
++-- AlterTable: receipt-sync cursor on LoyverseConnection
++ALTER TABLE "LoyverseConnection" ADD COLUMN IF NOT EXISTS "lastReceiptSyncedAt" TIMESTAMP(3);
++ALTER TABLE "LoyverseConnection" ADD COLUMN IF NOT EXISTS "lastReceiptSyncError" TEXT;
++
++-- CreateEnum
++DO $$ BEGIN
++  CREATE TYPE "InvoiceSource" AS ENUM ('LOYVERSE');
++EXCEPTION
++  WHEN duplicate_object THEN null;
++END $$;
++
++DO $$ BEGIN
++  CREATE TYPE "InvoiceSyncStatus" AS ENUM ('SYNCED', 'ERROR');
++EXCEPTION
++  WHEN duplicate_object THEN null;
++END $$;
++
++-- CreateTable
++CREATE TABLE IF NOT EXISTS "Invoice" (
++    "id" TEXT NOT NULL,
++    "branchId" TEXT NOT NULL,
++    "source" "InvoiceSource" NOT NULL DEFAULT 'LOYVERSE',
++    "loyverseReceiptNumber" TEXT NOT NULL,
++    "loyverseStoreId" TEXT NOT NULL,
++    "loyverseOrder" TEXT,
++    "loyversePosDeviceId" TEXT,
++    "loyverseEmployeeId" TEXT,
++    "loyverseCustomerId" TEXT,
++    "receiptType" TEXT NOT NULL DEFAULT 'SALE',
++    "refundFor" TEXT,
++    "receiptDate" TIMESTAMP(3) NOT NULL,
++    "currency" TEXT NOT NULL DEFAULT 'SAR',
++    "totalMoney" DECIMAL(18,2) NOT NULL,
++    "totalTax" DECIMAL(18,2) NOT NULL DEFAULT 0,
++    "totalDiscount" DECIMAL(18,2) NOT NULL DEFAULT 0,
++    "totalPaid" DECIMAL(18,2) NOT NULL DEFAULT 0,
++    "cancelled" BOOLEAN NOT NULL DEFAULT false,
++    "syncStatus" "InvoiceSyncStatus" NOT NULL DEFAULT 'SYNCED',
++    "lastSyncedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
++    "lastSyncError" TEXT,
++    "rawPayload" JSONB,
++    "isActive" BOOLEAN NOT NULL DEFAULT true,
++    "createdBy" TEXT,
++    "updatedBy" TEXT,
++    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
++    "updatedAt" TIMESTAMP(3) NOT NULL,
++
++    CONSTRAINT "Invoice_pkey" PRIMARY KEY ("id")
++);
++
++-- CreateTable
++CREATE TABLE IF NOT EXISTS "InvoiceLineItem" (
++    "id" TEXT NOT NULL,
++    "invoiceId" TEXT NOT NULL,
++    "loyverseLineItemId" TEXT,
++    "loyverseVariantId" TEXT,
++    "itemName" TEXT NOT NULL,
++    "sku" TEXT,
++    "quantity" DECIMAL(18,3) NOT NULL,
++    "price" DECIMAL(18,2) NOT NULL,
++    "cost" DECIMAL(18,2),
++    "lineNote" TEXT,
++    "grossTotal" DECIMAL(18,2) NOT NULL,
++    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
++
++    CONSTRAINT "InvoiceLineItem_pkey" PRIMARY KEY ("id")
++);
++
++-- CreateTable
++CREATE TABLE IF NOT EXISTS "InvoicePayment" (
++    "id" TEXT NOT NULL,
++    "invoiceId" TEXT NOT NULL,
++    "loyversePaymentTypeId" TEXT,
++    "paymentTypeName" TEXT,
++    "moneyAmount" DECIMAL(18,2) NOT NULL,
++    "paidAt" TIMESTAMP(3),
++    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
++
++    CONSTRAINT "InvoicePayment_pkey" PRIMARY KEY ("id")
++);
++
++-- CreateIndex
++CREATE UNIQUE INDEX IF NOT EXISTS "Invoice_branchId_loyverseReceiptNumber_key" ON "Invoice"("branchId", "loyverseReceiptNumber");
++
++-- CreateIndex
++CREATE INDEX IF NOT EXISTS "Invoice_branchId_receiptDate_idx" ON "Invoice"("branchId", "receiptDate");
++
++-- CreateIndex
++CREATE INDEX IF NOT EXISTS "Invoice_branchId_isActive_idx" ON "Invoice"("branchId", "isActive");
++
++-- CreateIndex
++CREATE INDEX IF NOT EXISTS "Invoice_syncStatus_idx" ON "Invoice"("syncStatus");
++
++-- CreateIndex
++CREATE INDEX IF NOT EXISTS "InvoiceLineItem_invoiceId_idx" ON "InvoiceLineItem"("invoiceId");
++
++-- CreateIndex
++CREATE INDEX IF NOT EXISTS "InvoicePayment_invoiceId_idx" ON "InvoicePayment"("invoiceId");
++
++-- AddForeignKey
++DO $$ BEGIN
++  ALTER TABLE "Invoice" ADD CONSTRAINT "Invoice_branchId_fkey"
++    FOREIGN KEY ("branchId") REFERENCES "Branch"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
++EXCEPTION
++  WHEN duplicate_object THEN null;
++END $$;
++
++-- AddForeignKey
++DO $$ BEGIN
++  ALTER TABLE "InvoiceLineItem" ADD CONSTRAINT "InvoiceLineItem_invoiceId_fkey"
++    FOREIGN KEY ("invoiceId") REFERENCES "Invoice"("id") ON DELETE CASCADE ON UPDATE CASCADE;
++EXCEPTION
++  WHEN duplicate_object THEN null;
++END $$;
++
++-- AddForeignKey
++DO $$ BEGIN
++  ALTER TABLE "InvoicePayment" ADD CONSTRAINT "InvoicePayment_invoiceId_fkey"
++    FOREIGN KEY ("invoiceId") REFERENCES "Invoice"("id") ON DELETE CASCADE ON UPDATE CASCADE;
++EXCEPTION
++  WHEN duplicate_object THEN null;
++END $$;
+diff --git a/prisma/schema.prisma b/prisma/schema.prisma
+index 26ac00c..e8968c5 100644
+--- a/prisma/schema.prisma
++++ b/prisma/schema.prisma
+@@ -103,6 +103,7 @@ model Branch {
+   shifts       Shift[]
+ 
+   loyverseConnection LoyverseConnection?
++  invoices           Invoice[]
+ 
+   isActive Boolean @default(true)
+ 
+@@ -357,6 +358,12 @@ model LoyverseConnection {
+   // Short, non-sensitive error summary only (never raw provider payloads).
+   lastError       String?
+ 
++  // ── Receipt sync (Phase 3B) ──
++  // Watermark used as `updated_at_min` on the next poll — never rewound,
++  // only advanced after a page of receipts has been durably upserted.
++  lastReceiptSyncedAt DateTime?
++  lastReceiptSyncError String?
++
+   // Audit: who initiated/last modified this connection
+   createdBy String?
+   updatedBy String?
+@@ -367,3 +374,106 @@ model LoyverseConnection {
+   @@unique([storeId])
+   @@index([status])
+ }
++
++// ─── Invoices (Phase 3B: receipt sync + Phase 4: invoice screens) ────
++// An Invoice mirrors one Loyverse "receipt". It is intentionally a
++// separate model from the legacy `Sale` model above: `Sale` is this app's
++// own internal pump-side POS record, while `Invoice` is a read-through
++// copy of a document that lives authoritatively in Loyverse. Loyverse does
++// not allow editing an already-processed receipt via its API, so
++// `Invoice` is a synced, view-only record — never a source of truth we
++// write back from.
++enum InvoiceSource {
++  LOYVERSE
++}
++
++enum InvoiceSyncStatus {
++  SYNCED
++  ERROR
++}
++
++model Invoice {
++  id String @id @default(cuid())
++
++  branchId String
++  branch   Branch @relation(fields: [branchId], references: [id])
++
++  source InvoiceSource @default(LOYVERSE)
++
++  // Loyverse identity. `receiptNumber` is the natural key used for
++  // idempotent upserts — the same receipt can never be inserted twice.
++  loyverseReceiptNumber String
++  loyverseStoreId       String
++  loyverseOrder         String?
++  loyversePosDeviceId   String?
++  loyverseEmployeeId    String?
++  loyverseCustomerId    String?
++  receiptType           String  @default("SALE") // SALE | REFUND, as reported by Loyverse
++  refundFor             String? // receiptNumber of the original sale, if this is a refund
++
++  receiptDate DateTime
++  currency    String   @default("SAR")
++
++  totalMoney    Decimal @db.Decimal(18, 2)
++  totalTax      Decimal @default(0) @db.Decimal(18, 2)
++  totalDiscount Decimal @default(0) @db.Decimal(18, 2)
++  totalPaid     Decimal @default(0) @db.Decimal(18, 2)
++  cancelled     Boolean @default(false)
++
++  syncStatus         InvoiceSyncStatus @default(SYNCED)
++  lastSyncedAt       DateTime          @default(now())
++  lastSyncError      String?
++  // Full receipt payload as returned by Loyverse — kept for audit/debug
++  // and so re-mapping logic can evolve without re-fetching history.
++  rawPayload         Json?
++
++  isActive Boolean @default(true)
++
++  createdBy String?
++  updatedBy String?
++  createdAt DateTime @default(now())
++  updatedAt DateTime @updatedAt
++
++  lineItems InvoiceLineItem[]
++  payments  InvoicePayment[]
++
++  @@unique([branchId, loyverseReceiptNumber])
++  @@index([branchId, receiptDate])
++  @@index([branchId, isActive])
++  @@index([syncStatus])
++}
++
++model InvoiceLineItem {
++  id        String  @id @default(cuid())
++  invoiceId String
++  invoice   Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
++
++  loyverseLineItemId String?
++  loyverseVariantId  String?
++  itemName           String
++  sku                String?
++  quantity           Decimal @db.Decimal(18, 3)
++  price              Decimal @db.Decimal(18, 2)
++  cost               Decimal? @db.Decimal(18, 2)
++  lineNote           String?
++  grossTotal         Decimal @db.Decimal(18, 2)
++
++  createdAt DateTime @default(now())
++
++  @@index([invoiceId])
++}
++
++model InvoicePayment {
++  id        String  @id @default(cuid())
++  invoiceId String
++  invoice   Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
++
++  loyversePaymentTypeId String?
++  paymentTypeName       String?
++  moneyAmount           Decimal   @db.Decimal(18, 2)
++  paidAt                DateTime?
++
++  createdAt DateTime @default(now())
++
++  @@index([invoiceId])
++}
+diff --git a/src/app/(dashboard)/invoices/[id]/page.tsx b/src/app/(dashboard)/invoices/[id]/page.tsx
+new file mode 100644
+index 0000000..0308d1a
+--- /dev/null
++++ b/src/app/(dashboard)/invoices/[id]/page.tsx
+@@ -0,0 +1,139 @@
++import Link from 'next/link'
++import { notFound } from 'next/navigation'
++import { ArrowLeft, Receipt } from 'lucide-react'
++import { requireUser } from '@/lib/rbac'
++import { getInvoiceDetail } from '@/lib/services/invoice-service'
++
++type PageProps = {
++  params: Promise<{ id: string }>
++}
++
++export default async function InvoiceDetailPage({ params }: PageProps) {
++  await requireUser()
++  const { id } = await params
++
++  const invoice = await getInvoiceDetail(id)
++
++  if (!invoice) {
++    notFound()
++  }
++
++  return (
++    <div className="mx-auto max-w-3xl space-y-6">
++      <Link
++        href="/invoices"
++        className="flex w-fit items-center gap-1.5 text-sm text-gray-500 hover:text-gray-700"
++      >
++        <ArrowLeft size={15} />
++        Back to invoices
++      </Link>
++
++      <div className="rounded-xl border border-gray-200 bg-white p-6">
++        {/* Header */}
++        <div className="flex items-start justify-between gap-4 border-b border-dashed border-gray-200 pb-4">
++          <div className="flex items-center gap-3">
++            <div className="rounded-lg bg-amber-100 p-2">
++              <Receipt size={20} className="text-amber-600" />
++            </div>
++            <div>
++              <p className="text-lg font-semibold text-gray-800">
++                Receipt {invoice.loyverseReceiptNumber}
++              </p>
++              <p className="text-sm text-gray-500">
++                {new Date(invoice.receiptDate).toLocaleString()} · {invoice.branch.nameEn}
++              </p>
++            </div>
++          </div>
++          <div className="text-right">
++            <span
++              className={`rounded-full px-2.5 py-1 text-xs font-semibold ${
++                invoice.receiptType === 'REFUND'
++                  ? 'bg-red-100 text-red-700'
++                  : 'bg-green-100 text-green-700'
++              }`}
++            >
++              {invoice.cancelled ? 'Cancelled' : invoice.receiptType}
++            </span>
++            {invoice.refundFor ? (
++              <p className="mt-1 text-xs text-gray-400">Refund for {invoice.refundFor}</p>
++            ) : null}
++          </div>
++        </div>
++
++        {/* Line items */}
++        <div className="py-4">
++          <p className="mb-2 text-xs font-medium uppercase tracking-wide text-gray-400">Items</p>
++          <table className="w-full text-sm">
++            <thead className="text-xs text-gray-400">
++              <tr>
++                <th className="pb-2 text-left font-medium">Item</th>
++                <th className="pb-2 text-right font-medium">Qty</th>
++                <th className="pb-2 text-right font-medium">Price</th>
++                <th className="pb-2 text-right font-medium">Total</th>
++              </tr>
++            </thead>
++            <tbody className="divide-y divide-gray-100">
++              {invoice.lineItems.map(item => (
++                <tr key={item.id}>
++                  <td className="py-2 text-gray-700">
++                    {item.itemName}
++                    {item.lineNote ? (
++                      <span className="block text-xs text-gray-400">{item.lineNote}</span>
++                    ) : null}
++                  </td>
++                  <td className="py-2 text-right text-gray-600">{item.quantity}</td>
++                  <td className="py-2 text-right text-gray-600">{item.price}</td>
++                  <td className="py-2 text-right font-medium text-gray-800">
++                    {item.grossTotal}
++                  </td>
++                </tr>
++              ))}
++            </tbody>
++          </table>
++        </div>
++
++        {/* Totals */}
++        <div className="space-y-1 border-t border-dashed border-gray-200 pt-4 text-sm">
++          <div className="flex justify-between text-gray-500">
++            <span>Discount</span>
++            <span>-{invoice.totalDiscount}</span>
++          </div>
++          <div className="flex justify-between text-gray-500">
++            <span>Tax</span>
++            <span>{invoice.totalTax}</span>
++          </div>
++          <div className="flex justify-between text-base font-semibold text-gray-800">
++            <span>Total</span>
++            <span>{invoice.totalMoney} {invoice.currency}</span>
++          </div>
++        </div>
++
++        {/* Payments */}
++        <div className="mt-4 border-t border-dashed border-gray-200 pt-4">
++          <p className="mb-2 text-xs font-medium uppercase tracking-wide text-gray-400">
++            Payments
++          </p>
++          {invoice.payments.length === 0 ? (
++            <p className="text-sm text-gray-400">No payment records for this receipt.</p>
++          ) : (
++            <div className="space-y-1">
++              {invoice.payments.map(payment => (
++                <div key={payment.id} className="flex justify-between text-sm text-gray-600">
++                  <span>{payment.paymentTypeName ?? 'Payment'}</span>
++                  <span>{payment.moneyAmount}</span>
++                </div>
++              ))}
++            </div>
++          )}
++        </div>
++
++        {/* Sync metadata */}
++        <div className="mt-6 rounded-lg bg-gray-50 px-4 py-3 text-xs text-gray-400">
++          Synced from Loyverse on {new Date(invoice.lastSyncedAt).toLocaleString()}. This record
++          mirrors Loyverse and cannot be edited here — Loyverse does not support editing a
++          processed receipt.
++        </div>
++      </div>
++    </div>
++  )
++}
+diff --git a/src/app/(dashboard)/invoices/loading.tsx b/src/app/(dashboard)/invoices/loading.tsx
+new file mode 100644
+index 0000000..4742e75
+--- /dev/null
++++ b/src/app/(dashboard)/invoices/loading.tsx
+@@ -0,0 +1,15 @@
++export default function InvoicesLoading() {
++  return (
++    <div className="space-y-6 animate-pulse">
++      <div className="flex items-center justify-between">
++        <div className="space-y-2">
++          <div className="h-6 w-40 rounded bg-gray-200" />
++          <div className="h-4 w-56 rounded bg-gray-100" />
++        </div>
++        <div className="h-9 w-28 rounded-lg bg-gray-200" />
++      </div>
++      <div className="h-28 rounded-xl border border-gray-200 bg-gray-50" />
++      <div className="h-80 rounded-xl border border-gray-200 bg-gray-50" />
++    </div>
++  )
++}
+diff --git a/src/app/(dashboard)/invoices/page.tsx b/src/app/(dashboard)/invoices/page.tsx
+new file mode 100644
+index 0000000..29de47b
+--- /dev/null
++++ b/src/app/(dashboard)/invoices/page.tsx
+@@ -0,0 +1,101 @@
++import { Building2, PlugZap } from 'lucide-react'
++import { Suspense } from 'react'
++import { requireUser } from '@/lib/rbac'
++import { resolveActiveBranch } from '@/lib/branch-context'
++import { prisma } from '@/lib/prisma'
++import { searchInvoices } from '@/lib/services/invoice-service'
++import { invoiceSearchParamsSchema, toInvoiceFilters } from '@/lib/validation/invoice.schema'
++import InvoiceFilters from '@/components/invoices/InvoiceFilters'
++import InvoicesTable from '@/components/invoices/InvoicesTable'
++import InvoicesPagination from '@/components/invoices/InvoicesPagination'
++import SyncNowButton from '@/components/invoices/SyncNowButton'
++
++type PageProps = {
++  searchParams: Promise<Record<string, string | string[] | undefined>>
++}
++
++export default async function InvoicesPage({ searchParams }: PageProps) {
++  const user = await requireUser()
++  const { activeBranch } = await resolveActiveBranch()
++
++  // Permission state: signed in, but no accessible branch yet.
++  if (!activeBranch) {
++    return (
++      <div className="rounded-xl border border-amber-200 bg-amber-50 p-5">
++        <Building2 size={24} className="mb-2 text-amber-600" />
++        <h1 className="text-lg font-semibold text-amber-900">No branch access</h1>
++        <p className="mt-1 text-sm text-amber-700">
++          You don&apos;t have access to any active branch yet. Contact an administrator to be
++          assigned to a branch.
++        </p>
++      </div>
++    )
++  }
++
++  const connection = await prisma.loyverseConnection.findUnique({
++    where: { branchId: activeBranch.id },
++    select: { status: true, storeName: true },
++  })
++
++  const canManage = user.role === 'ADMIN' || user.role === 'MANAGER'
++
++  // Empty/setup state: branch has no Loyverse store connected yet.
++  if (!connection || connection.status !== 'CONNECTED') {
++    return (
++      <div className="rounded-xl border border-gray-200 bg-white p-8 text-center">
++        <PlugZap size={36} className="mx-auto mb-3 text-gray-300" />
++        <h1 className="text-lg font-semibold text-gray-800">Loyverse isn&apos;t connected yet</h1>
++        <p className="mx-auto mt-1 max-w-md text-sm text-gray-500">
++          {canManage
++            ? 'Connect this branch to Loyverse from Settings to start syncing invoices.'
++            : 'Ask an administrator or manager to connect this branch to Loyverse.'}
++        </p>
++        {canManage ? (
++          <a
++            href="/settings"
++            className="mt-4 inline-block rounded-lg bg-gray-900 px-4 py-2 text-sm font-medium text-white hover:bg-gray-700"
++          >
++            Go to Settings
++          </a>
++        ) : null}
++      </div>
++    )
++  }
++
++  const rawParams = await searchParams
++  const singleValueParams = Object.fromEntries(
++    Object.entries(rawParams).map(([key, value]) => [key, Array.isArray(value) ? value[0] : value]),
++  )
++  const parsedParams = invoiceSearchParamsSchema.safeParse(singleValueParams)
++  const filters = toInvoiceFilters(parsedParams.success ? parsedParams.data : {})
++
++  const { invoices, total, page, pageSize } = await searchInvoices(filters)
++
++  return (
++    <div className="space-y-6">
++      <div className="flex items-center justify-between gap-4">
++        <div>
++          <h1 className="text-2xl font-bold text-gray-800">Invoices</h1>
++          <p className="mt-0.5 text-sm text-gray-500">
++            {total} invoice{total === 1 ? '' : 's'} · {activeBranch.nameEn}
++            {connection.storeName ? ` · Loyverse: ${connection.storeName}` : ''}
++          </p>
++        </div>
++        {canManage ? <SyncNowButton /> : null}
++      </div>
++
++      <Suspense fallback={<div className="h-[76px] rounded-xl border border-gray-200 bg-gray-50" />}>
++        <InvoiceFilters />
++      </Suspense>
++
++      <InvoicesTable invoices={invoices} />
++
++      <InvoicesPagination
++        page={page}
++        pageSize={pageSize}
++        total={total}
++        searchParams={singleValueParams}
++      />
++    </div>
++  )
++}
+diff --git a/src/app/actions/invoice.actions.ts b/src/app/actions/invoice.actions.ts
+new file mode 100644
+index 0000000..b9e57ce
+--- /dev/null
++++ b/src/app/actions/invoice.actions.ts
+@@ -0,0 +1,43 @@
++'use server'
++
++import { revalidatePath } from 'next/cache'
++import { resolveActiveBranch } from '@/lib/branch-context'
++import { ForbiddenError, requireRole } from '@/lib/rbac'
++import { syncReceiptsForBranch, type SyncSummary } from '@/lib/integrations/loyverse/sync'
++
++export type TriggerSyncResult =
++  | { success: true; summary: SyncSummary }
++  | { success: false; error: string }
++
++/**
++ * Manual "Sync Now" action. ADMIN/MANAGER only — mirrors the RBAC
++ * convention used across every other mutating action in this app.
++ * Read queries live in src/lib/services/invoice-service.ts, not here —
++ * this file is reserved for mutations, per the "actions vs services"
++ * separation used throughout the app.
++ */
++export async function triggerManualSync(): Promise<TriggerSyncResult> {
++  try {
++    const actor = await requireRole(['ADMIN', 'MANAGER'])
++    const { activeBranch } = await resolveActiveBranch()
++
++    if (!activeBranch) {
++      return { success: false, error: 'No active branch selected' }
++    }
++
++    const summary = await syncReceiptsForBranch(activeBranch.id, actor.id)
++
++    if (summary.error) {
++      return { success: false, error: summary.error }
++    }
++
++    revalidatePath('/invoices')
++    return { success: true, summary }
++  } catch (error: unknown) {
++    if (error instanceof ForbiddenError) {
++      return { success: false, error: error.message }
++    }
++    console.error('Manual Loyverse sync failed:', error)
++    return { success: false, error: 'Failed to sync invoices from Loyverse' }
++  }
++}
+diff --git a/src/app/api/integrations/loyverse/sync-cron/route.ts b/src/app/api/integrations/loyverse/sync-cron/route.ts
+new file mode 100644
+index 0000000..93e88f3
+--- /dev/null
++++ b/src/app/api/integrations/loyverse/sync-cron/route.ts
+@@ -0,0 +1,34 @@
++import { NextRequest, NextResponse } from 'next/server'
++import { syncAllConnectedBranches } from '@/lib/integrations/loyverse/sync'
++
++// Not used by the default Docker deployment (which relies on the
++// in-process scheduler in src/instrumentation.ts), but kept available
++// for hosts that prefer to trigger sync from an external
++// cron/orchestrator instead of an always-on Node process.
++//
++// Protected by a shared secret rather than a user session, since the
++// caller here is infrastructure, not a signed-in person.
++export async function POST(request: NextRequest) {
++  const configuredSecret = process.env.CRON_SECRET
++
++  if (!configuredSecret) {
++    return NextResponse.json(
++      { success: false, error: 'CRON_SECRET is not configured on this deployment' },
++      { status: 503 },
++    )
++  }
++
++  const providedSecret = request.headers.get('authorization')?.replace(/^Bearer\s+/i, '')
++
++  if (!providedSecret || providedSecret !== configuredSecret) {
++    return NextResponse.json({ success: false, error: 'Unauthorized' }, { status: 401 })
++  }
++
++  try {
++    const summaries = await syncAllConnectedBranches('system:cron-http')
++    return NextResponse.json({ success: true, summaries })
++  } catch (error) {
++    console.error('[Loyverse] Cron-triggered sync failed:', error)
++    return NextResponse.json({ success: false, error: 'Sync failed' }, { status: 500 })
++  }
++}
+diff --git a/src/components/invoices/InvoiceFilters.tsx b/src/components/invoices/InvoiceFilters.tsx
+new file mode 100644
+index 0000000..740efe9
+--- /dev/null
++++ b/src/components/invoices/InvoiceFilters.tsx
+@@ -0,0 +1,178 @@
++'use client'
++
++import { useState, useTransition } from 'react'
++import { useRouter, usePathname, useSearchParams } from 'next/navigation'
++import { Search, X } from 'lucide-react'
++
++export default function InvoiceFilters() {
++  const router = useRouter()
++  const pathname = usePathname()
++  const searchParams = useSearchParams()
++  const [isPending, startTransition] = useTransition()
++
++  const [q, setQ] = useState(searchParams.get('q') ?? '')
++  const [from, setFrom] = useState(searchParams.get('from') ?? '')
++  const [to, setTo] = useState(searchParams.get('to') ?? '')
++  const [receiptType, setReceiptType] = useState(searchParams.get('receiptType') ?? 'ALL')
++  const [paymentType, setPaymentType] = useState(searchParams.get('paymentType') ?? '')
++  const [minAmount, setMinAmount] = useState(searchParams.get('minAmount') ?? '')
++  const [maxAmount, setMaxAmount] = useState(searchParams.get('maxAmount') ?? '')
++
++  function applyFilters(overrides: Record<string, string> = {}) {
++    const values: Record<string, string> = {
++      q,
++      from,
++      to,
++      receiptType,
++      paymentType,
++      minAmount,
++      maxAmount,
++      ...overrides,
++    }
++
++    const params = new URLSearchParams()
++    for (const [key, value] of Object.entries(values)) {
++      if (value && value !== 'ALL') params.set(key, value)
++    }
++    // Any filter change resets pagination back to page 1.
++
++    startTransition(() => {
++      router.push(`${pathname}?${params.toString()}`)
++    })
++  }
++
++  function handleReset() {
++    setQ('')
++    setFrom('')
++    setTo('')
++    setReceiptType('ALL')
++    setPaymentType('')
++    setMinAmount('')
++    setMaxAmount('')
++    startTransition(() => {
++      router.push(pathname)
++    })
++  }
++
++  const hasActiveFilters = Boolean(
++    searchParams.get('q') ||
++      searchParams.get('from') ||
++      searchParams.get('to') ||
++      searchParams.get('paymentType') ||
++      searchParams.get('minAmount') ||
++      searchParams.get('maxAmount') ||
++      (searchParams.get('receiptType') && searchParams.get('receiptType') !== 'ALL'),
++  )
++
++  return (
++    <form
++      onSubmit={event => {
++        event.preventDefault()
++        applyFilters()
++      }}
++      className="grid grid-cols-1 gap-3 rounded-xl border border-gray-200 bg-white p-4 sm:grid-cols-2 lg:grid-cols-6"
++    >
++      <div className="lg:col-span-2">
++        <label className="mb-1 block text-xs font-medium text-gray-500">
++          Receipt / order number
++        </label>
++        <div className="relative">
++          <Search size={15} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-gray-400" />
++          <input
++            value={q}
++            onChange={e => setQ(e.target.value)}
++            placeholder="Search…"
++            className="w-full rounded-lg border border-gray-300 py-1.5 pl-8 pr-2 text-sm focus:border-gray-500 focus:outline-none"
++          />
++        </div>
++      </div>
++
++      <div>
++        <label className="mb-1 block text-xs font-medium text-gray-500">From</label>
++        <input
++          type="date"
++          value={from}
++          onChange={e => setFrom(e.target.value)}
++          className="w-full rounded-lg border border-gray-300 py-1.5 px-2 text-sm focus:border-gray-500 focus:outline-none"
++        />
++      </div>
++
++      <div>
++        <label className="mb-1 block text-xs font-medium text-gray-500">To</label>
++        <input
++          type="date"
++          value={to}
++          onChange={e => setTo(e.target.value)}
++          className="w-full rounded-lg border border-gray-300 py-1.5 px-2 text-sm focus:border-gray-500 focus:outline-none"
++        />
++      </div>
++
++      <div>
++        <label className="mb-1 block text-xs font-medium text-gray-500">Type</label>
++        <select
++          value={receiptType}
++          onChange={e => setReceiptType(e.target.value)}
++          className="w-full rounded-lg border border-gray-300 py-1.5 px-2 text-sm focus:border-gray-500 focus:outline-none"
++        >
++          <option value="ALL">All</option>
++          <option value="SALE">Sale</option>
++          <option value="REFUND">Refund</option>
++        </select>
++      </div>
++
++      <div>
++        <label className="mb-1 block text-xs font-medium text-gray-500">Payment type</label>
++        <input
++          value={paymentType}
++          onChange={e => setPaymentType(e.target.value)}
++          placeholder="e.g. Cash"
++          className="w-full rounded-lg border border-gray-300 py-1.5 px-2 text-sm focus:border-gray-500 focus:outline-none"
++        />
++      </div>
++
++      <div>
++        <label className="mb-1 block text-xs font-medium text-gray-500">Min amount</label>
++        <input
++          type="number"
++          min={0}
++          step="0.01"
++          value={minAmount}
++          onChange={e => setMinAmount(e.target.value)}
++          className="w-full rounded-lg border border-gray-300 py-1.5 px-2 text-sm focus:border-gray-500 focus:outline-none"
++        />
++      </div>
++
++      <div>
++        <label className="mb-1 block text-xs font-medium text-gray-500">Max amount</label>
++        <input
++          type="number"
++          min={0}
++          step="0.01"
++          value={maxAmount}
++          onChange={e => setMaxAmount(e.target.value)}
++          className="w-full rounded-lg border border-gray-300 py-1.5 px-2 text-sm focus:border-gray-500 focus:outline-none"
++        />
++      </div>
++
++      <div className="flex items-end gap-2 lg:col-span-2">
++        <button
++          type="submit"
++          disabled={isPending}
++          className="rounded-lg bg-amber-500 px-4 py-1.5 text-sm font-medium text-gray-900 hover:bg-amber-400 disabled:opacity-60"
++        >
++          Apply filters
++        </button>
++        {hasActiveFilters ? (
++          <button
++            type="button"
++            onClick={handleReset}
++            className="flex items-center gap-1 rounded-lg border border-gray-300 px-3 py-1.5 text-sm text-gray-600 hover:bg-gray-50"
++          >
++            <X size={14} />
++            Clear
++          </button>
++        ) : null}
++      </div>
++    </form>
++  )
++}
+diff --git a/src/components/invoices/InvoicesPagination.tsx b/src/components/invoices/InvoicesPagination.tsx
+new file mode 100644
+index 0000000..ad8249f
+--- /dev/null
++++ b/src/components/invoices/InvoicesPagination.tsx
+@@ -0,0 +1,66 @@
++import Link from 'next/link'
++import { ChevronLeft, ChevronRight } from 'lucide-react'
++
++type InvoicesPaginationProps = {
++  page: number
++  pageSize: number
++  total: number
++  searchParams: Record<string, string | undefined>
++}
++
++function buildHref(searchParams: Record<string, string | undefined>, page: number) {
++  const params = new URLSearchParams()
++  for (const [key, value] of Object.entries(searchParams)) {
++    if (value && key !== 'page') params.set(key, value)
++  }
++  if (page > 1) params.set('page', String(page))
++  const query = params.toString()
++  return query ? `/invoices?${query}` : '/invoices'
++}
++
++export default function InvoicesPagination({
++  page,
++  pageSize,
++  total,
++  searchParams,
++}: InvoicesPaginationProps) {
++  const totalPages = Math.max(1, Math.ceil(total / pageSize))
++
++  if (totalPages <= 1) return null
++
++  const start = (page - 1) * pageSize + 1
++  const end = Math.min(page * pageSize, total)
++
++  return (
++    <div className="flex items-center justify-between px-1 text-sm text-gray-500">
++      <span>
++        Showing {start}–{end} of {total}
++      </span>
++      <div className="flex items-center gap-2">
++        <Link
++          href={buildHref(searchParams, Math.max(1, page - 1))}
++          aria-disabled={page <= 1}
++          className={`flex items-center gap-1 rounded-lg border border-gray-300 px-3 py-1.5 ${
++            page <= 1 ? 'pointer-events-none opacity-40' : 'hover:bg-gray-50'
++          }`}
++        >
++          <ChevronLeft size={14} />
++          Prev
++        </Link>
++        <span className="text-xs">
++          Page {page} of {totalPages}
++        </span>
++        <Link
++          href={buildHref(searchParams, Math.min(totalPages, page + 1))}
++          aria-disabled={page >= totalPages}
++          className={`flex items-center gap-1 rounded-lg border border-gray-300 px-3 py-1.5 ${
++            page >= totalPages ? 'pointer-events-none opacity-40' : 'hover:bg-gray-50'
++          }`}
++        >
++          Next
++          <ChevronRight size={14} />
++        </Link>
++      </div>
++    </div>
++  )
++}
+diff --git a/src/components/invoices/InvoicesTable.tsx b/src/components/invoices/InvoicesTable.tsx
+new file mode 100644
+index 0000000..af09163
+--- /dev/null
++++ b/src/components/invoices/InvoicesTable.tsx
+@@ -0,0 +1,72 @@
++import Link from 'next/link'
++import { Receipt } from 'lucide-react'
++import type { InvoiceListItem } from '@/lib/services/invoice-service'
++
++type InvoicesTableProps = {
++  invoices: InvoiceListItem[]
++}
++
++export default function InvoicesTable({ invoices }: InvoicesTableProps) {
++  if (invoices.length === 0) {
++    return (
++      <div className="rounded-xl border border-gray-200 bg-white py-16 text-center text-gray-400">
++        <Receipt size={40} className="mx-auto mb-3 opacity-30" />
++        <p className="text-sm">No invoices match these filters.</p>
++      </div>
++    )
++  }
++
++  return (
++    <div className="overflow-hidden rounded-xl border border-gray-200 bg-white">
++      <table className="w-full text-left text-sm">
++        <thead className="bg-gray-50 text-xs uppercase tracking-wide text-gray-500">
++          <tr>
++            <th className="px-4 py-3 font-medium">Receipt #</th>
++            <th className="px-4 py-3 font-medium">Date</th>
++            <th className="px-4 py-3 font-medium">Type</th>
++            <th className="px-4 py-3 font-medium">Payment</th>
++            <th className="px-4 py-3 text-right font-medium">Total</th>
++            <th className="px-4 py-3 text-right font-medium">Paid</th>
++            <th className="px-4 py-3" />
++          </tr>
++        </thead>
++        <tbody className="divide-y divide-gray-100">
++          {invoices.map(invoice => (
++            <tr key={invoice.id} className="hover:bg-gray-50">
++              <td className="px-4 py-3 font-medium text-gray-800">
++                {invoice.loyverseReceiptNumber}
++              </td>
++              <td className="px-4 py-3 text-gray-600">
++                {new Date(invoice.receiptDate).toLocaleString()}
++              </td>
++              <td className="px-4 py-3">
++                <span
++                  className={`rounded-full px-2 py-0.5 text-xs font-semibold ${
++                    invoice.receiptType === 'REFUND'
++                      ? 'bg-red-100 text-red-700'
++                      : 'bg-green-100 text-green-700'
++                  }`}
++                >
++                  {invoice.cancelled ? 'Cancelled' : invoice.receiptType}
++                </span>
++              </td>
++              <td className="px-4 py-3 text-gray-600">{invoice.paymentSummary}</td>
++              <td className="px-4 py-3 text-right font-medium text-gray-800">
++                {invoice.totalMoney}
++              </td>
++              <td className="px-4 py-3 text-right text-gray-600">{invoice.totalPaid}</td>
++              <td className="px-4 py-3 text-right">
++                <Link
++                  href={`/invoices/${invoice.id}`}
++                  className="text-sm font-medium text-amber-600 hover:text-amber-500"
++                >
++                  View
++                </Link>
++              </td>
++            </tr>
++          ))}
++        </tbody>
++      </table>
++    </div>
++  )
++}
+diff --git a/src/components/invoices/SyncNowButton.tsx b/src/components/invoices/SyncNowButton.tsx
+new file mode 100644
+index 0000000..4f80f6a
+--- /dev/null
++++ b/src/components/invoices/SyncNowButton.tsx
+@@ -0,0 +1,58 @@
++'use client'
++
++import { useState, useTransition } from 'react'
++import { RefreshCw, CheckCircle2, AlertCircle } from 'lucide-react'
++import { triggerManualSync } from '@/app/actions/invoice.actions'
++
++type Feedback = { type: 'success' | 'error'; message: string } | null
++
++export default function SyncNowButton() {
++  const [isPending, startTransition] = useTransition()
++  const [feedback, setFeedback] = useState<Feedback>(null)
++
++  function handleClick() {
++    setFeedback(null)
++    startTransition(async () => {
++      const result = await triggerManualSync()
++
++      if (!result.success) {
++        setFeedback({ type: 'error', message: result.error })
++        return
++      }
++
++      const { created, updated, fetched } = result.summary
++      setFeedback({
++        type: 'success',
++        message:
++          fetched === 0
++            ? 'Already up to date — no new receipts found'
++            : `Synced ${fetched} receipt${fetched === 1 ? '' : 's'} (${created} new, ${updated} updated)`,
++      })
++    })
++  }
++
++  return (
++    <div className="flex items-center gap-3">
++      {feedback ? (
++        <span
++          className={`flex items-center gap-1.5 text-xs font-medium ${
++            feedback.type === 'success' ? 'text-green-700' : 'text-red-600'
++          }`}
++        >
++          {feedback.type === 'success' ? <CheckCircle2 size={14} /> : <AlertCircle size={14} />}
++          {feedback.message}
++        </span>
++      ) : null}
++
++      <button
++        type="button"
++        onClick={handleClick}
++        disabled={isPending}
++        className="flex items-center gap-2 rounded-lg bg-gray-900 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-gray-700 disabled:cursor-not-allowed disabled:opacity-60"
++      >
++        <RefreshCw size={16} className={isPending ? 'animate-spin' : ''} />
++        {isPending ? 'Syncing…' : 'Sync Now'}
++      </button>
++    </div>
++  )
++}
+diff --git a/src/components/layout/Sidebar.tsx b/src/components/layout/Sidebar.tsx
+index 7b1d61e..88b60c9 100644
+--- a/src/components/layout/Sidebar.tsx
++++ b/src/components/layout/Sidebar.tsx
+@@ -18,6 +18,7 @@ import {
+   ShieldCheck,
+   Building2,
+   LogOut,
++  Receipt,
+ } from 'lucide-react'
+ 
+ type Role = 'ADMIN' | 'MANAGER' | 'CASHIER'
+@@ -33,6 +34,7 @@ const navItems = [
+   { label: 'Inventory', href: '/fuel', icon: Gauge },
+   { label: 'New Sale', href: '/sales/new', icon: Plus },
+   { label: 'Sales Log', href: '/sales', icon: ShoppingCart },
++  { label: 'Invoices', href: '/invoices', icon: Receipt },
+   { label: 'Employees', href: '/employees', icon: Users },
+   { label: 'Shift History', href: '/employees/shifts', icon: Clock },
+   { label: 'Suppliers', href: '/suppliers', icon: Truck },
+diff --git a/src/instrumentation.ts b/src/instrumentation.ts
+new file mode 100644
+index 0000000..c402203
+--- /dev/null
++++ b/src/instrumentation.ts
+@@ -0,0 +1,10 @@
++// Next.js calls `register()` once when the server process starts.
++// https://nextjs.org/docs/app/building-your-application/optimizing/instrumentation
++export async function register() {
++  // Guard against running in the edge runtime or during the build step —
++  // node-cron and Prisma both require the Node.js runtime.
++  if (process.env.NEXT_RUNTIME === 'nodejs') {
++    const { startLoyverseSyncScheduler } = await import('@/lib/integrations/loyverse/scheduler')
++    startLoyverseSyncScheduler()
++  }
++}
+diff --git a/src/lib/integrations/loyverse/client.ts b/src/lib/integrations/loyverse/client.ts
+index b4c0f07..e5fee47 100644
+--- a/src/lib/integrations/loyverse/client.ts
++++ b/src/lib/integrations/loyverse/client.ts
+@@ -6,13 +6,22 @@ import { getLoyverseEnv } from './env'
+ //   - Authorize:    GET  https://api.loyverse.com/oauth/authorize
+ //   - Token/Refresh:POST https://api.loyverse.com/oauth/token
+ //   - Stores:       GET  https://api.loyverse.com/v1.0/stores
+-// No webhook subscription or receipt endpoints are called in this phase —
+-// those belong to Phase 3B and will be verified against the live developer
+-// dashboard before implementation, per the "don't invent endpoints" rule.
++//   - Receipts:     GET  https://api.loyverse.com/v1.0/receipts
++//     Supports store_id, created_at_min/max, updated_at_min/max and
++//     cursor-based pagination (limit + cursor). Used for Phase 3B pull
++//     sync — polling only. Loyverse also offers webhooks for receipts,
++//     configured from their Back Office UI, but the exact payload shape
++//     and signature-verification scheme could not be confirmed from the
++//     live docs at implementation time, so no webhook receiver is wired
++//     up yet (see sync.ts header comment).
++//   - Loyverse does not support editing an already-processed receipt via
++//     the API, which is why Invoice records synced from Loyverse are
++//     treated as view-only in this app.
+ 
+ const LOYVERSE_AUTHORIZE_URL = 'https://api.loyverse.com/oauth/authorize'
+ const LOYVERSE_TOKEN_URL = 'https://api.loyverse.com/oauth/token'
+ const LOYVERSE_STORES_URL = 'https://api.loyverse.com/v1.0/stores'
++const LOYVERSE_RECEIPTS_URL = 'https://api.loyverse.com/v1.0/receipts'
+ 
+ // Maximum number of retries for the token endpoint when AWS WAF returns a
+ // 202 "challenge" response. We pause briefly between attempts so the WAF
+@@ -405,3 +414,128 @@ export async function fetchStores(
+       name: store.name,
+     }))
+ }
++
++// ─── Receipts (Phase 3B) ─────────────────────────────────────────────
++
++export interface LoyverseReceiptLineItem {
++  id?: string
++  variant_id?: string
++  item_name?: string
++  variant_name?: string
++  sku?: string
++  quantity: number
++  price: number
++  cost?: number
++  line_note?: string
++  gross_total_money?: number
++  total_money?: number
++}
++
++export interface LoyverseReceiptPayment {
++  payment_type_id?: string
++  name?: string
++  money_amount: number
++  paid_at?: string
++}
++
++export interface LoyverseReceipt {
++  receipt_number: string
++  store_id: string
++  order?: string
++  pos_device_id?: string
++  employee_id?: string
++  customer_id?: string
++  receipt_type?: string // SALE | REFUND
++  refund_for?: string
++  receipt_date: string
++  cancelled_at?: string | null
++  total_money: number
++  total_tax?: number
++  total_discount?: number
++  line_items: LoyverseReceiptLineItem[]
++  payments: LoyverseReceiptPayment[]
++}
++
++export interface FetchReceiptsPageParams {
++  accessToken: string
++  storeId: string
++  updatedAtMin?: string
++  cursor?: string
++  limit?: number
++}
++
++export interface FetchReceiptsPageResult {
++  receipts: LoyverseReceipt[]
++  cursor: string | null
++}
++
++/**
++ * Fetches a single page of receipts for a store, newest sync watermark
++ * first. The caller is responsible for following `cursor` until it comes
++ * back null to drain a full page set — see the pagination loop inside
++ * `syncReceiptsForBranch` in sync.ts.
++ */
++export async function fetchReceiptsPage(
++  params: FetchReceiptsPageParams,
++): Promise<FetchReceiptsPageResult> {
++  const { accessToken, storeId, updatedAtMin, cursor, limit = 250 } = params
++
++  const url = new URL(LOYVERSE_RECEIPTS_URL)
++  url.searchParams.set('store_id', storeId)
++  url.searchParams.set('limit', String(limit))
++  if (updatedAtMin) url.searchParams.set('updated_at_min', updatedAtMin)
++  if (cursor) url.searchParams.set('cursor', cursor)
++
++  const response = await fetch(url.toString(), {
++    method: 'GET',
++    headers: buildApiHeaders(accessToken),
++    cache: 'no-store',
++  })
++
++  const rawBody = await response.text()
++  const contentType = response.headers.get('content-type') ?? 'unknown'
++
++  let data: unknown = null
++  if (rawBody.trim()) {
++    try {
++      data = JSON.parse(rawBody)
++    } catch {
++      console.error('[Loyverse] Receipts returned non-JSON:', {
++        status: response.status,
++        contentType,
++        contentLength: rawBody.length,
++      })
++      throw new LoyverseApiError('Loyverse receipts returned an invalid response', response.status || 502)
++    }
++  }
++
++  if (!response.ok) {
++    let errorCode = 'unknown_error'
++    if (data && typeof data === 'object' && 'errors' in data && Array.isArray(data.errors)) {
++      const firstError = data.errors[0] as { code?: unknown } | undefined
++      if (typeof firstError?.code === 'string') errorCode = firstError.code
++    }
++
++    console.error('[Loyverse] Receipts request failed:', {
++      status: response.status,
++      statusText: response.statusText,
++      contentType,
++      contentLength: rawBody.length,
++      errorCode,
++    })
++
++    throw new LoyverseApiError(`Failed to fetch receipts from Loyverse: ${errorCode}`, response.status)
++  }
++
++  const receipts =
++    data && typeof data === 'object' && 'receipts' in data && Array.isArray(data.receipts)
++      ? (data.receipts as LoyverseReceipt[])
++      : []
++
++  const nextCursor =
++    data && typeof data === 'object' && 'cursor' in data && typeof data.cursor === 'string'
++      ? data.cursor
++      : null
++
++  return { receipts, cursor: nextCursor }
++}
+diff --git a/src/lib/integrations/loyverse/scheduler.ts b/src/lib/integrations/loyverse/scheduler.ts
+new file mode 100644
+index 0000000..1e35d8a
+--- /dev/null
++++ b/src/lib/integrations/loyverse/scheduler.ts
+@@ -0,0 +1,50 @@
++import 'server-only'
++import cron from 'node-cron'
++import { syncAllConnectedBranches } from './sync'
++
++// Default: every 5 minutes. Configurable so this can be tuned per
++// deployment without a code change — set LOYVERSE_SYNC_CRON to any valid
++// cron expression (e.g. "*/15 * * * *" for 15 minutes).
++const DEFAULT_CRON_EXPRESSION = '*/5 * * * *'
++
++let started = false
++
++/**
++ * Starts the in-process receipt-sync scheduler exactly once per server
++ * process. Intended to run inside a long-lived Node process (this app's
++ * Docker deployment), not a serverless/edge runtime — see
++ * src/instrumentation.ts for where this is called from.
++ */
++export function startLoyverseSyncScheduler(): void {
++  if (started) return
++  started = true
++
++  const expression = process.env.LOYVERSE_SYNC_CRON || DEFAULT_CRON_EXPRESSION
++
++  if (!cron.validate(expression)) {
++    console.error(
++      `[Loyverse] Invalid LOYVERSE_SYNC_CRON expression "${expression}" — scheduler not started`,
++    )
++    started = false
++    return
++  }
++
++  cron.schedule(expression, async () => {
++    try {
++      const summaries = await syncAllConnectedBranches()
++      const totalCreated = summaries.reduce((sum, s) => sum + s.created, 0)
++      const totalFailed = summaries.reduce((sum, s) => sum + s.failed, 0)
++      if (totalCreated > 0 || totalFailed > 0) {
++        console.log('[Loyverse] Scheduled sync complete', {
++          branches: summaries.length,
++          created: totalCreated,
++          failed: totalFailed,
++        })
++      }
++    } catch (error) {
++      console.error('[Loyverse] Scheduled sync run threw unexpectedly:', error)
++    }
++  })
++
++  console.log(`[Loyverse] Receipt sync scheduler started (${expression})`)
++}
+diff --git a/src/lib/integrations/loyverse/sync.ts b/src/lib/integrations/loyverse/sync.ts
+new file mode 100644
+index 0000000..88e496b
+--- /dev/null
++++ b/src/lib/integrations/loyverse/sync.ts
+@@ -0,0 +1,229 @@
++import 'server-only'
++import { Prisma } from '../../../../prisma/generated/client'
++import { prisma } from '@/lib/prisma'
++import { getValidLoyverseAccessToken } from './connection'
++import { fetchReceiptsPage, type LoyverseReceipt } from './client'
++
++// ─── Phase 3B: receipt pull sync ─────────────────────────────────────
++// Real-time "autosave" would ideally be push-based (a Loyverse webhook
++// firing the moment a POS receipt is created), but the exact webhook
++// payload shape and signature-verification scheme are not confirmed from
++// the live Loyverse docs at implementation time. Per the "don't invent
++// endpoints/fields/webhook capabilities" rule, this phase implements only
++// the fully-documented pull path: `GET /v1.0/receipts`, polled on an
++// interval (see scheduler.ts) plus an on-demand "Sync Now" action.
++//
++// Idempotency: `Invoice` has a unique (branchId, loyverseReceiptNumber)
++// constraint, and every sync run upserts on that key — running the same
++// window twice, or overlapping with the scheduler, can never create a
++// duplicate Invoice for the same Loyverse receipt.
++
++const RECEIPTS_PAGE_LIMIT = 250
++// Small negative offset applied to the "since" watermark so a receipt
++// updated in the last few seconds of a run (and thus possibly missed by
++// an exact-boundary `updated_at_min`) gets picked up again next run. Since
++// upserts are idempotent this costs nothing but a harmless re-write.
++const WATERMARK_SAFETY_MS = 60_000
++
++export interface SyncSummary {
++  branchId: string
++  fetched: number
++  created: number
++  updated: number
++  failed: number
++  error?: string
++}
++
++function toDecimalInput(value: number | undefined | null): number {
++  return value ?? 0
++}
++
++function resolveItemName(lineItem: LoyverseReceipt['line_items'][number]): string {
++  return lineItem.item_name?.trim() || lineItem.variant_name?.trim() || lineItem.sku?.trim() || 'Item'
++}
++
++function resolveLineTotal(lineItem: LoyverseReceipt['line_items'][number]): number {
++  if (typeof lineItem.total_money === 'number') return lineItem.total_money
++  if (typeof lineItem.gross_total_money === 'number') return lineItem.gross_total_money
++  return lineItem.price * lineItem.quantity
++}
++
++async function upsertReceipt(
++  branchId: string,
++  storeId: string,
++  receipt: LoyverseReceipt,
++  actorId: string,
++): Promise<'created' | 'updated' | 'failed'> {
++  try {
++    const totalPaid = receipt.payments.reduce((sum, payment) => sum + (payment.money_amount ?? 0), 0)
++
++    const existing = await prisma.invoice.findUnique({
++      where: {
++        branchId_loyverseReceiptNumber: {
++          branchId,
++          loyverseReceiptNumber: receipt.receipt_number,
++        },
++      },
++      select: { id: true },
++    })
++
++    const baseData = {
++      branchId,
++      loyverseReceiptNumber: receipt.receipt_number,
++      loyverseStoreId: storeId,
++      loyverseOrder: receipt.order ?? null,
++      loyversePosDeviceId: receipt.pos_device_id ?? null,
++      loyverseEmployeeId: receipt.employee_id ?? null,
++      loyverseCustomerId: receipt.customer_id ?? null,
++      receiptType: receipt.receipt_type ?? 'SALE',
++      refundFor: receipt.refund_for ?? null,
++      receiptDate: new Date(receipt.receipt_date),
++      totalMoney: toDecimalInput(receipt.total_money),
++      totalTax: toDecimalInput(receipt.total_tax),
++      totalDiscount: toDecimalInput(receipt.total_discount),
++      totalPaid: toDecimalInput(totalPaid),
++      cancelled: Boolean(receipt.cancelled_at),
++      syncStatus: 'SYNCED' as const,
++      lastSyncedAt: new Date(),
++      lastSyncError: null,
++      rawPayload: receipt as unknown as Prisma.InputJsonValue,
++      updatedBy: actorId,
++    }
++
++    await prisma.$transaction(async tx => {
++      const invoice = existing
++        ? await tx.invoice.update({ where: { id: existing.id }, data: baseData })
++        : await tx.invoice.create({ data: { ...baseData, createdBy: actorId } })
++
++      // Line items and payments are always fully replaced on re-sync —
++      // Loyverse receipts are immutable once created, so this only
++      // actually changes anything the first time a receipt is seen.
++      await tx.invoiceLineItem.deleteMany({ where: { invoiceId: invoice.id } })
++      await tx.invoicePayment.deleteMany({ where: { invoiceId: invoice.id } })
++
++      if (receipt.line_items.length > 0) {
++        await tx.invoiceLineItem.createMany({
++          data: receipt.line_items.map(lineItem => ({
++            invoiceId: invoice.id,
++            loyverseLineItemId: lineItem.id ?? null,
++            loyverseVariantId: lineItem.variant_id ?? null,
++            itemName: resolveItemName(lineItem),
++            sku: lineItem.sku ?? null,
++            quantity: toDecimalInput(lineItem.quantity),
++            price: toDecimalInput(lineItem.price),
++            cost: lineItem.cost != null ? toDecimalInput(lineItem.cost) : null,
++            lineNote: lineItem.line_note ?? null,
++            grossTotal: toDecimalInput(resolveLineTotal(lineItem)),
++          })),
++        })
++      }
++
++      if (receipt.payments.length > 0) {
++        await tx.invoicePayment.createMany({
++          data: receipt.payments.map(payment => ({
++            invoiceId: invoice.id,
++            loyversePaymentTypeId: payment.payment_type_id ?? null,
++            paymentTypeName: payment.name ?? null,
++            moneyAmount: toDecimalInput(payment.money_amount),
++            paidAt: payment.paid_at ? new Date(payment.paid_at) : null,
++          })),
++        })
++      }
++    })
++
++    return existing ? 'updated' : 'created'
++  } catch (error) {
++    console.error(`[Loyverse] Failed to upsert receipt ${receipt.receipt_number}:`, error)
++    return 'failed'
++  }
++}
++
++/**
++ * Syncs all receipts updated since the branch's last successful sync
++ * watermark. Safe to call concurrently with itself (e.g. a manual "Sync
++ * Now" click racing the scheduler) — worst case is redundant, idempotent
++ * upserts of the same page.
++ */
++export async function syncReceiptsForBranch(branchId: string, actorId: string): Promise<SyncSummary> {
++  const summary: SyncSummary = { branchId, fetched: 0, created: 0, updated: 0, failed: 0 }
++
++  const connection = await prisma.loyverseConnection.findUnique({ where: { branchId } })
++
++  if (!connection || connection.status !== 'CONNECTED' || !connection.storeId) {
++    summary.error = 'Branch has no connected Loyverse store'
++    return summary
++  }
++
++  const accessToken = await getValidLoyverseAccessToken(branchId)
++  if (!accessToken) {
++    summary.error = 'Could not obtain a valid Loyverse access token'
++    await prisma.loyverseConnection.update({
++      where: { branchId },
++      data: { lastReceiptSyncError: summary.error },
++    })
++    return summary
++  }
++
++  const since = connection.lastReceiptSyncedAt
++    ? new Date(connection.lastReceiptSyncedAt.getTime() - WATERMARK_SAFETY_MS)
++    : undefined
++
++  const runStartedAt = new Date()
++
++  try {
++    let cursor: string | undefined = undefined
++
++    do {
++      const page = await fetchReceiptsPage({
++        accessToken,
++        storeId: connection.storeId,
++        updatedAtMin: since?.toISOString(),
++        cursor,
++        limit: RECEIPTS_PAGE_LIMIT,
++      })
++
++      summary.fetched += page.receipts.length
++
++      for (const receipt of page.receipts) {
++        const result = await upsertReceipt(branchId, connection.storeId, receipt, actorId)
++        if (result === 'created') summary.created += 1
++        else if (result === 'updated') summary.updated += 1
++        else summary.failed += 1
++      }
++
++      cursor = page.cursor ?? undefined
++    } while (cursor)
++
++    await prisma.loyverseConnection.update({
++      where: { branchId },
++      data: { lastReceiptSyncedAt: runStartedAt, lastReceiptSyncError: null },
++    })
++  } catch (error) {
++    const message = error instanceof Error ? error.message : 'Unknown sync error'
++    summary.error = message
++    console.error(`[Loyverse] Receipt sync failed for branch ${branchId}:`, error)
++    await prisma.loyverseConnection.update({
++      where: { branchId },
++      data: { lastReceiptSyncError: message },
++    })
++  }
++
++  return summary
++}
++
++/**
++ * Syncs every CONNECTED branch. Used by the scheduler and the cron-secret
++ * protected API route. Failures on one branch never block the others.
++ */
++export async function syncAllConnectedBranches(actorId = 'system:scheduler'): Promise<SyncSummary[]> {
++  const connections = await prisma.loyverseConnection.findMany({
++    where: { status: 'CONNECTED' },
++    select: { branchId: true },
++  })
++
++  const summaries: SyncSummary[] = []
++  for (const connection of connections) {
++    summaries.push(await syncReceiptsForBranch(connection.branchId, actorId))
++  }
++  return summaries
++}
+diff --git a/src/lib/services/invoice-service.ts b/src/lib/services/invoice-service.ts
+new file mode 100644
+index 0000000..15e83ed
+--- /dev/null
++++ b/src/lib/services/invoice-service.ts
+@@ -0,0 +1,183 @@
++import 'server-only'
++import { prisma } from '@/lib/prisma'
++import { resolveActiveBranch } from '@/lib/branch-context'
++import { INVOICES_PAGE_SIZE, type InvoiceFilters } from '@/lib/validation/invoice.schema'
++import type { Prisma } from '../../../prisma/generated/client'
++
++export type InvoiceListItem = {
++  id: string
++  loyverseReceiptNumber: string
++  receiptType: string
++  receiptDate: string
++  totalMoney: string
++  totalPaid: string
++  cancelled: boolean
++  paymentSummary: string
++}
++
++export type InvoiceSearchResult = {
++  invoices: InvoiceListItem[]
++  total: number
++  page: number
++  pageSize: number
++}
++
++function buildWhere(branchId: string, filters: InvoiceFilters): Prisma.InvoiceWhereInput {
++  const where: Prisma.InvoiceWhereInput = {
++    branchId,
++    isActive: true,
++  }
++
++  if (filters.from || filters.to) {
++    where.receiptDate = {
++      ...(filters.from ? { gte: filters.from } : {}),
++      ...(filters.to ? { lte: filters.to } : {}),
++    }
++  }
++
++  if (filters.receiptType) {
++    where.receiptType = filters.receiptType
++  }
++
++  if (filters.minAmount != null || filters.maxAmount != null) {
++    where.totalMoney = {
++      ...(filters.minAmount != null ? { gte: filters.minAmount } : {}),
++      ...(filters.maxAmount != null ? { lte: filters.maxAmount } : {}),
++    }
++  }
++
++  if (filters.q) {
++    where.OR = [
++      { loyverseReceiptNumber: { contains: filters.q, mode: 'insensitive' } },
++      { loyverseOrder: { contains: filters.q, mode: 'insensitive' } },
++    ]
++  }
++
++  if (filters.paymentType) {
++    where.payments = {
++      some: { paymentTypeName: { contains: filters.paymentType, mode: 'insensitive' } },
++    }
++  }
++
++  return where
++}
++
++/**
++ * Searches invoices for the active branch. Read-only, branch-scoped via
++ * resolveActiveBranch (never trusts a branchId from client input).
++ */
++export async function searchInvoices(filters: InvoiceFilters): Promise<InvoiceSearchResult> {
++  const { activeBranch } = await resolveActiveBranch()
++
++  if (!activeBranch) {
++    return { invoices: [], total: 0, page: filters.page, pageSize: INVOICES_PAGE_SIZE }
++  }
++
++  const where = buildWhere(activeBranch.id, filters)
++  const skip = (filters.page - 1) * INVOICES_PAGE_SIZE
++
++  const [rows, total] = await Promise.all([
++    prisma.invoice.findMany({
++      where,
++      include: { payments: true },
++      orderBy: { receiptDate: 'desc' },
++      skip,
++      take: INVOICES_PAGE_SIZE,
++    }),
++    prisma.invoice.count({ where }),
++  ])
++
++  return {
++    invoices: rows.map(invoice => ({
++      id: invoice.id,
++      loyverseReceiptNumber: invoice.loyverseReceiptNumber,
++      receiptType: invoice.receiptType,
++      receiptDate: invoice.receiptDate.toISOString(),
++      totalMoney: invoice.totalMoney.toFixed(2),
++      totalPaid: invoice.totalPaid.toFixed(2),
++      cancelled: invoice.cancelled,
++      paymentSummary:
++        invoice.payments.map(payment => payment.paymentTypeName).filter(Boolean).join(', ') || '—',
++    })),
++    total,
++    page: filters.page,
++    pageSize: INVOICES_PAGE_SIZE,
++  }
++}
++
++export type InvoiceDetail = {
++  id: string
++  loyverseReceiptNumber: string
++  receiptType: string
++  refundFor: string | null
++  receiptDate: string
++  currency: string
++  totalMoney: string
++  totalTax: string
++  totalDiscount: string
++  totalPaid: string
++  cancelled: boolean
++  lastSyncedAt: string
++  branch: { nameEn: string; nameAr: string; branchCode: string }
++  lineItems: Array<{
++    id: string
++    itemName: string
++    lineNote: string | null
++    quantity: string
++    price: string
++    grossTotal: string
++  }>
++  payments: Array<{ id: string; paymentTypeName: string | null; moneyAmount: string }>
++}
++
++/**
++ * Fetches one invoice for the preview/detail screen, scoped to the active
++ * branch so a user can never view another branch's invoice by guessing
++ * an id. All Decimal/Date fields are converted to plain strings here so
++ * the result is safe to pass to a Client Component if a future screen
++ * needs to.
++ */
++export async function getInvoiceDetail(id: string): Promise<InvoiceDetail | null> {
++  const { activeBranch } = await resolveActiveBranch()
++  if (!activeBranch) return null
++
++  const invoice = await prisma.invoice.findFirst({
++    where: { id, branchId: activeBranch.id, isActive: true },
++    include: {
++      lineItems: { orderBy: { createdAt: 'asc' } },
++      payments: { orderBy: { createdAt: 'asc' } },
++      branch: { select: { nameEn: true, nameAr: true, branchCode: true } },
++    },
++  })
++
++  if (!invoice) return null
++
++  return {
++    id: invoice.id,
++    loyverseReceiptNumber: invoice.loyverseReceiptNumber,
++    receiptType: invoice.receiptType,
++    refundFor: invoice.refundFor,
++    receiptDate: invoice.receiptDate.toISOString(),
++    currency: invoice.currency,
++    totalMoney: invoice.totalMoney.toFixed(2),
++    totalTax: invoice.totalTax.toFixed(2),
++    totalDiscount: invoice.totalDiscount.toFixed(2),
++    totalPaid: invoice.totalPaid.toFixed(2),
++    cancelled: invoice.cancelled,
++    lastSyncedAt: invoice.lastSyncedAt.toISOString(),
++    branch: invoice.branch,
++    lineItems: invoice.lineItems.map(item => ({
++      id: item.id,
++      itemName: item.itemName,
++      lineNote: item.lineNote,
++      quantity: item.quantity.toString(),
++      price: item.price.toFixed(2),
++      grossTotal: item.grossTotal.toFixed(2),
++    })),
++    payments: invoice.payments.map(payment => ({
++      id: payment.id,
++      paymentTypeName: payment.paymentTypeName,
++      moneyAmount: payment.moneyAmount.toFixed(2),
++    })),
++  }
++}
+diff --git a/src/lib/validation/invoice.schema.ts b/src/lib/validation/invoice.schema.ts
+new file mode 100644
+index 0000000..fa5415a
+--- /dev/null
++++ b/src/lib/validation/invoice.schema.ts
+@@ -0,0 +1,56 @@
++import { z } from 'zod'
++
++// Parses raw Next.js searchParams (string | string[] | undefined) into a
++// typed, safe filter object. Every field is optional — an empty filter
++// set means "everything for the active branch".
++export const invoiceSearchParamsSchema = z.object({
++  from: z.string().optional(),
++  to: z.string().optional(),
++  q: z.string().trim().max(100).optional(),
++  paymentType: z.string().trim().max(100).optional(),
++  receiptType: z.enum(['ALL', 'SALE', 'REFUND']).optional(),
++  minAmount: z.coerce.number().nonnegative().optional(),
++  maxAmount: z.coerce.number().nonnegative().optional(),
++  page: z.coerce.number().int().positive().optional(),
++})
++
++export type InvoiceSearchParams = z.infer<typeof invoiceSearchParamsSchema>
++
++export interface InvoiceFilters {
++  from?: Date
++  to?: Date
++  q?: string
++  paymentType?: string
++  receiptType?: 'ALL' | 'SALE' | 'REFUND'
++  minAmount?: number
++  maxAmount?: number
++  page: number
++}
++
++export const INVOICES_PAGE_SIZE = 20
++
++/**
++ * Converts raw, validated search params into typed filters ready for a
++ * Prisma `where` clause. Invalid dates are silently dropped rather than
++ * throwing — a bad filter should degrade to "no filter", not a 500.
++ */
++export function toInvoiceFilters(params: InvoiceSearchParams): InvoiceFilters {
++  const from = params.from ? new Date(params.from) : undefined
++  const to = params.to ? new Date(params.to) : undefined
++
++  if (to) {
++    // Treat "to" as inclusive of the whole day.
++    to.setHours(23, 59, 59, 999)
++  }
++
++  return {
++    from: from && !Number.isNaN(from.getTime()) ? from : undefined,
++    to: to && !Number.isNaN(to.getTime()) ? to : undefined,
++    q: params.q || undefined,
++    paymentType: params.paymentType || undefined,
++    receiptType: params.receiptType && params.receiptType !== 'ALL' ? params.receiptType : undefined,
++    minAmount: params.minAmount,
++    maxAmount: params.maxAmount,
++    page: params.page ?? 1,
++  }
++}
+diff --git a/src/middleware.ts b/src/middleware.ts
+index 456f41c..7aa354f 100644
+--- a/src/middleware.ts
++++ b/src/middleware.ts
+@@ -27,6 +27,7 @@ export const config = {
+     '/dispensers/:path*',
+     '/fuel/:path*',
+     '/sales/:path*',
++    '/invoices/:path*',
+     '/employees/:path*',
+     '/suppliers/:path*',
+     '/reports/:path*',
