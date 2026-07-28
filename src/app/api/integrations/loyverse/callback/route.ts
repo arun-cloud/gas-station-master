@@ -5,9 +5,9 @@ import { compareAndConsumeState } from '@/lib/integrations/loyverse/oauth-state'
 import { upsertConnectionFromTokenResponse } from '@/lib/integrations/loyverse/connection'
 import { LoyverseConfigError } from '@/lib/integrations/loyverse/env'
 
-function redirectToSettings(request: NextRequest, params: Record<string, string>) {
+function redirectToLoyverseSettings(request: NextRequest, params: Record<string, string>) {
   const appUrl = process.env.NEXT_PUBLIC_APP_URL?.trim() || request.nextUrl.origin
-  const url = new URL('/settings', appUrl)
+  const url = new URL('/settings/integrations/loyverse', appUrl)
   for (const [key, value] of Object.entries(params)) {
     url.searchParams.set(key, value)
   }
@@ -20,17 +20,17 @@ export async function GET(request: NextRequest) {
   const providerError = request.nextUrl.searchParams.get('error')
 
   if (providerError) {
-    return redirectToSettings(request, { loyverse: 'failed', error: providerError })
+    return redirectToLoyverseSettings(request, { loyverse: 'failed', error: providerError })
   }
 
   const { valid, branchId } = await compareAndConsumeState(returnedState)
 
   if (!valid || !branchId) {
-    return redirectToSettings(request, { loyverse: 'failed', error: 'invalid_state' })
+    return redirectToLoyverseSettings(request, { loyverse: 'failed', error: 'invalid_state' })
   }
 
   if (!code) {
-    return redirectToSettings(request, { loyverse: 'failed', error: 'missing_code', branchId })
+    return redirectToLoyverseSettings(request, { loyverse: 'failed', error: 'missing_code', branchId })
   }
 
   try {
@@ -54,7 +54,7 @@ export async function GET(request: NextRequest) {
           message: error.message,
         })
 
-        return redirectToSettings(request, {
+        return redirectToLoyverseSettings(request, {
           loyverse: 'failed',
           error: 'token_exchange_failed',
           status: String(error.status),
@@ -76,7 +76,7 @@ export async function GET(request: NextRequest) {
           message: error.message,
         })
 
-        return redirectToSettings(request, {
+        return redirectToLoyverseSettings(request, {
           loyverse: 'failed',
           error: 'stores_fetch_failed',
           status: String(error.status),
@@ -94,7 +94,7 @@ export async function GET(request: NextRequest) {
         actorId: actor.id,
         status: 'ERROR',
       })
-      return redirectToSettings(request, { loyverse: 'failed', error: 'no_stores_found', branchId })
+      return redirectToLoyverseSettings(request, { loyverse: 'failed', error: 'no_stores_found', branchId })
     }
 
     if (stores.length === 1) {
@@ -106,7 +106,7 @@ export async function GET(request: NextRequest) {
         storeId: stores[0].id,
         storeName: stores[0].name,
       })
-      return redirectToSettings(request, { loyverse: 'connected', branchId })
+      return redirectToLoyverseSettings(request, { loyverse: 'connected', branchId })
     }
 
     // Multiple stores visible to this merchant — persist the tokens now,
@@ -117,19 +117,19 @@ export async function GET(request: NextRequest) {
       actorId: actor.id,
       status: 'PENDING_STORE_SELECTION',
     })
-    return redirectToSettings(request, { loyverse: 'select-store', branchId })
+    return redirectToLoyverseSettings(request, { loyverse: 'select-store', branchId })
   } catch (error) {
     if (error instanceof ForbiddenError) {
-      return redirectToSettings(request, { loyverse: 'failed', error: 'forbidden', branchId })
+      return redirectToLoyverseSettings(request, { loyverse: 'failed', error: 'forbidden', branchId })
     }
     if (error instanceof LoyverseConfigError) {
-      return redirectToSettings(request, { loyverse: 'failed', error: 'not_configured', branchId })
+      return redirectToLoyverseSettings(request, { loyverse: 'failed', error: 'not_configured', branchId })
     }
     if (error instanceof LoyverseApiError) {
       console.error('Loyverse callback API error:', error.message, error.status)
-      return redirectToSettings(request, { loyverse: 'failed', error: 'provider_error', branchId })
+      return redirectToLoyverseSettings(request, { loyverse: 'failed', error: 'provider_error', branchId })
     }
     console.error('Loyverse callback failed:', error)
-    return redirectToSettings(request, { loyverse: 'failed', error: 'unknown', branchId })
+    return redirectToLoyverseSettings(request, { loyverse: 'failed', error: 'unknown', branchId })
   }
 }

@@ -35,7 +35,8 @@ const pageTitles: Record<string, string> = {
 
 export default function Topbar({ branches, activeBranchId }: TopbarProps) {
   const pathname = usePathname()
-  const pageTitle = pageTitles[pathname] ?? 'Gas Station MS'
+  const pageTitle =
+    pageTitles[pathname] ?? (pathname.startsWith('/settings/') ? 'Settings' : 'Gas Station MS')
 
   return (
     <header className="h-16 bg-white border-b border-gray-200 flex items-center justify-between px-6 shrink-0">

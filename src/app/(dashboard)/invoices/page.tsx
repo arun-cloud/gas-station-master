@@ -1,5 +1,6 @@
 import { Building2, PlugZap } from 'lucide-react'
 import { Suspense } from 'react'
+import Link from 'next/link'
 import { requireUser } from '@/lib/rbac'
 import { resolveActiveBranch } from '@/lib/branch-context'
 import { prisma } from '@/lib/prisma'
@@ -51,12 +52,12 @@ export default async function InvoicesPage({ searchParams }: PageProps) {
             : 'Ask an administrator or manager to connect this branch to Loyverse.'}
         </p>
         {canManage ? (
-          <a
-            href="/settings"
+          <Link
+            href="/settings/integrations/loyverse"
             className="mt-4 inline-block rounded-lg bg-gray-900 px-4 py-2 text-sm font-medium text-white hover:bg-gray-700"
           >
-            Go to Settings
-          </a>
+            Configure Loyverse
+          </Link>
         ) : null}
       </div>
     )

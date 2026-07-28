@@ -39,8 +39,9 @@ const navItems = [
   { label: 'Shift History', href: '/employees/shifts', icon: Clock },
   { label: 'Suppliers', href: '/suppliers', icon: Truck },
   { label: 'Reports', href: '/reports', icon: BarChart3 },
-  { label: 'Settings', href: '/settings', icon: Settings },
 ]
+
+const settingsNavItem = { label: 'Settings', href: '/settings', icon: Settings }
 
 const roleLabels: Record<Role, string> = {
   ADMIN: 'Administrator',
@@ -55,12 +56,14 @@ export default function Sidebar({ user }: { user: SidebarUser }) {
     user.role === 'ADMIN'
       ? [
           ...navItems,
+          settingsNavItem,
           { label: 'User Approvals', href: '/admin/users', icon: ShieldCheck },
           { label: 'Branches', href: '/admin/branches', icon: Building2 },
         ]
       : user.role === 'MANAGER'
         ? [
             ...navItems,
+            settingsNavItem,
             { label: 'User Approvals', href: '/admin/users', icon: ShieldCheck },
           ]
         : navItems

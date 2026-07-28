@@ -66,7 +66,7 @@ export async function selectLoyverseStore(formData: FormData): Promise<LoyverseA
       },
     })
 
-    revalidatePath('/settings')
+    revalidatePath('/settings/integrations/loyverse')
     return { success: true }
   } catch (error: unknown) {
     if (error instanceof ForbiddenError) {
@@ -105,7 +105,7 @@ export async function disconnectLoyverse(branchId: string): Promise<LoyverseActi
       },
     })
 
-    revalidatePath('/settings')
+    revalidatePath('/settings/integrations/loyverse')
     return { success: true }
   } catch (error: unknown) {
     if (error instanceof ForbiddenError) {
