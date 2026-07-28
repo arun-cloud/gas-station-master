@@ -1,0 +1,42 @@
+name: gas-station-development
+
+services:
+  app:
+    container_name: gas-station-app
+
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    env_file:
+      - .env
+
+    environment:
+      NODE_ENV: development
+
+      # Helps file changes get detected reliably through Docker Desktop.
+      WATCHPACK_POLLING: "true"
+
+    ports:
+      - "3000:3000"
+      - "5555:5555"
+
+    volumes:
+      # Mount project source for hot reload.
+      - .:/app
+
+      # Keep Linux node_modules inside Docker instead of mixing them
+      # with Windows node_modules.
+      - node_modules:/app/node_modules
+
+      # Preserve and isolate Next.js build cache.
+      - next_cache:/app/.next
+
+    init: true
+    restart: unless-stopped
+    stdin_open: true
+    tty: true
+
+volumes:
+  node_modules:
+  next_cache:

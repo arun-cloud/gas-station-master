@@ -97,10 +97,11 @@ model Branch {
   companyId String
   company   Company @relation(fields: [companyId], references: [id])
 
-  dispensers   Dispenser[]
-  fuelTanks    FuelTank[]
-  userBranches UserBranch[]
-  shifts       Shift[]
+  dispensers       Dispenser[]
+  fuelTanks        FuelTank[]
+  userBranches     UserBranch[]
+  shifts           Shift[]
+  supplierBranches SupplierBranch[]
 
   loyverseConnection LoyverseConnection?
   invoices           Invoice[]
@@ -186,8 +187,8 @@ model FuelTank {
   createdBy String?
   updatedBy String?
 
-  createdAt    DateTime @default(now())
-  updatedAt    DateTime @updatedAt
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   deliveries FuelDelivery[]
   branch     Branch         @relation(fields: [branchId], references: [id])
@@ -204,17 +205,60 @@ enum FuelType {
 }
 
 // ─── Suppliers & Deliveries ────────────────────────────
-model Supplier {
-  id          String   @id @default(cuid())
-  name        String
-  contactName String
-  phone       String
-  email       String?
-  isActive    Boolean  @default(true)
-  createdAt   DateTime @default(now())
 
+enum SupplierType {
+  FUEL
+  PRODUCT
+  SERVICE
+  UTILITY
+  GOVERNMENT
+  OTHER
+}
+
+model Supplier {
+  id               String       @id @default(cuid())
+  supplierCode     String       @unique
+  name             String // Legacy compatibility field; keep synchronized with nameEn
+  nameEn           String
+  nameAr           String?
+  legalName        String?
+  type             SupplierType @default(OTHER)
+  vatNumber        String?      @unique
+  crNumber         String?      @unique
+  contactName      String?
+  phone            String?
+  email            String?
+  address          String?
+  city             String?
+  paymentTermsDays Int          @default(0)
+  creditLimit      Decimal      @default(0) @db.Decimal(18, 2)
+  notes            String?
+  isActive         Boolean      @default(true)
+
+  createdBy String?
+  updatedBy String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  branches       SupplierBranch[]
   deliveries     FuelDelivery[]
   purchaseOrders PurchaseOrder[]
+
+  @@index([isActive])
+  @@index([type])
+}
+
+model SupplierBranch {
+  id         String   @id @default(cuid())
+  supplierId String
+  branchId   String
+  createdAt  DateTime @default(now())
+
+  supplier Supplier @relation(fields: [supplierId], references: [id], onDelete: Cascade)
+  branch   Branch   @relation(fields: [branchId], references: [id], onDelete: Cascade)
+
+  @@unique([supplierId, branchId])
+  @@index([branchId])
 }
 
 model FuelDelivery {
@@ -350,7 +394,7 @@ model LoyverseConnection {
   // plaintext. See src/lib/integrations/loyverse/crypto.ts.
   accessTokenEncrypted  String
   refreshTokenEncrypted String
-  tokenType             String  @default("Bearer")
+  tokenType             String   @default("Bearer")
   scope                 String?
   expiresAt             DateTime
 
@@ -361,7 +405,7 @@ model LoyverseConnection {
   // ── Receipt sync (Phase 3B) ──
   // Watermark used as `updated_at_min` on the next poll — never rewound,
   // only advanced after a page of receipts has been durably upserted.
-  lastReceiptSyncedAt DateTime?
+  lastReceiptSyncedAt  DateTime?
   lastReceiptSyncError String?
 
   // Audit: who initiated/last modified this connection
@@ -420,12 +464,12 @@ model Invoice {
   totalPaid     Decimal @default(0) @db.Decimal(18, 2)
   cancelled     Boolean @default(false)
 
-  syncStatus         InvoiceSyncStatus @default(SYNCED)
-  lastSyncedAt       DateTime          @default(now())
-  lastSyncError      String?
+  syncStatus    InvoiceSyncStatus @default(SYNCED)
+  lastSyncedAt  DateTime          @default(now())
+  lastSyncError String?
   // Full receipt payload as returned by Loyverse — kept for audit/debug
   // and so re-mapping logic can evolve without re-fetching history.
-  rawPayload         Json?
+  rawPayload    Json?
 
   isActive Boolean @default(true)
 
@@ -452,11 +496,11 @@ model InvoiceLineItem {
   loyverseVariantId  String?
   itemName           String
   sku                String?
-  quantity           Decimal @db.Decimal(18, 3)
-  price              Decimal @db.Decimal(18, 2)
+  quantity           Decimal  @db.Decimal(18, 3)
+  price              Decimal  @db.Decimal(18, 2)
   cost               Decimal? @db.Decimal(18, 2)
   lineNote           String?
-  grossTotal         Decimal @db.Decimal(18, 2)
+  grossTotal         Decimal  @db.Decimal(18, 2)
 
   createdAt DateTime @default(now())
 
