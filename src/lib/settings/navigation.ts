@@ -92,7 +92,7 @@ export const settingsCategories: readonly SettingsCategory[] = [
         href: '/settings/master-data/reference-data',
         icon: Tags,
         scope: 'Company',
-        status: 'Coming soon',
+        status: 'Available',
         allowedRoles: administratorsAndManagers,
       },
       {

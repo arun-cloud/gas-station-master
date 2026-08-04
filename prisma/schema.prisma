@@ -75,8 +75,60 @@ model Company {
 
   // Relations
   branches  Branch[]
+  referenceDataCategories ReferenceDataCategory[]
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+}
+
+// ─── Reference Data ────────────────────────────────────────
+model ReferenceDataCategory {
+  id String @id @default(cuid())
+
+  companyId String
+  company   Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  code        String
+  nameEn      String
+  nameAr      String?
+  description String?
+  isSystem    Boolean @default(false)
+  isActive    Boolean @default(true)
+
+  createdBy String?
+  updatedBy String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  values ReferenceDataValue[]
+
+  @@unique([companyId, code])
+  @@index([companyId, isActive])
+  @@index([companyId, nameEn])
+}
+
+model ReferenceDataValue {
+  id String @id @default(cuid())
+
+  categoryId String
+  category   ReferenceDataCategory @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+
+  code         String
+  nameEn       String
+  nameAr       String?
+  description  String?
+  displayOrder Int     @default(0)
+  isDefault    Boolean @default(false)
+  isSystem     Boolean @default(false)
+  isActive     Boolean @default(true)
+
+  createdBy String?
+  updatedBy String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([categoryId, code])
+  @@index([categoryId, isActive, displayOrder])
+  @@index([categoryId, isDefault])
 }
 
 // ─── Branches ─────────────────────────────────────────────
