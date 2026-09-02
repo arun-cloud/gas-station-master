@@ -28,6 +28,11 @@ model User {
   sales  Sale[]
   shifts Shift[]
 
+  openedBusinessDays  BusinessDay[]  @relation("BusinessDayOpenedBy")
+  closedBusinessDays  BusinessDay[]  @relation("BusinessDayClosedBy")
+  openedStationShifts StationShift[] @relation("StationShiftOpenedBy")
+  closedStationShifts StationShift[] @relation("StationShiftClosedBy")
+
   @@index([isActive])
 }
 
@@ -74,10 +79,10 @@ model Company {
   logo      String? // URL to the stored image
 
   // Relations
-  branches  Branch[]
+  branches                Branch[]
   referenceDataCategories ReferenceDataCategory[]
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  createdAt               DateTime @default(now())
+  updatedAt               DateTime @updatedAt
 }
 
 // ─── Reference Data ────────────────────────────────────────
@@ -154,6 +159,8 @@ model Branch {
   userBranches     UserBranch[]
   shifts           Shift[]
   supplierBranches SupplierBranch[]
+  businessDays     BusinessDay[]
+  stationShifts    StationShift[]
 
   loyverseConnection LoyverseConnection?
   invoices           Invoice[]
@@ -202,12 +209,12 @@ enum DispenserStatus {
 
 // ─── Nozzles ─────────────────────────────────────────────
 model Nozzle {
-  id             String   @id @default(cuid())
+  id             String  @id @default(cuid())
   nozzleNumber   Int
   fuelType       FuelType
-  currentReading Decimal  @default(0) @db.Decimal(18, 3)
+  currentReading Decimal @default(0) @db.Decimal(18, 3)
   dispenserID    String
-  isActive       Boolean  @default(true)
+  isActive       Boolean @default(true)
 
   // Audit: who created/last modified this nozzle
   createdBy String?
@@ -218,7 +225,8 @@ model Nozzle {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  sales Sale[]
+  sales                Sale[]
+  stationShiftReadings NozzleReading[]
 
   @@unique([dispenserID, nozzleNumber])
   @@index([isActive])
@@ -397,7 +405,7 @@ model Customer {
   sales Sale[]
 }
 
-// ─── Employees & Shifts ────────────────────────────────
+// ─── Employees & Shifts (legacy staff attendance) ──────
 model Shift {
   id          String      @id @default(cuid())
   userId      String
@@ -418,6 +426,117 @@ enum ShiftStatus {
   CLOSED
 }
 
+// ─── Phase 5A: Business Days & Station-level Shifts ────
+enum BusinessDayStatus {
+  OPEN
+  CLOSED
+}
+
+enum StationShiftStatus {
+  OPEN
+  CLOSED
+  EMERGENCY_CLOSED
+}
+
+enum NozzleReadingStatus {
+  OPEN
+  CLOSED
+}
+
+model BusinessDay {
+  id           String            @id @default(cuid())
+  branchId     String
+  businessDate DateTime          @db.Date
+  status       BusinessDayStatus @default(OPEN)
+  openedAt     DateTime          @default(now())
+  closedAt     DateTime?
+  openedById   String
+  closedById   String?
+  openingNotes String?
+  closingNotes String?
+
+  totalLitres      Decimal @default(0) @db.Decimal(18, 3)
+  totalSalesAmount Decimal @default(0) @db.Decimal(18, 2)
+
+  createdBy String?
+  updatedBy String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  branch   Branch @relation(fields: [branchId], references: [id], onDelete: Restrict)
+  openedBy User   @relation("BusinessDayOpenedBy", fields: [openedById], references: [id], onDelete: Restrict)
+  closedBy User?  @relation("BusinessDayClosedBy", fields: [closedById], references: [id], onDelete: Restrict)
+  shifts   StationShift[]
+
+  @@unique([branchId, businessDate])
+  @@index([branchId, status])
+  @@index([businessDate])
+}
+
+model StationShift {
+  id            String             @id @default(cuid())
+  branchId      String
+  businessDayId String
+  shiftNumber   Int
+  status        StationShiftStatus @default(OPEN)
+  openedAt      DateTime           @default(now())
+  closedAt      DateTime?
+  openingCash   Decimal            @default(0) @db.Decimal(18, 2)
+  closingCash   Decimal?           @db.Decimal(18, 2)
+
+  meterSalesLitres Decimal @default(0) @db.Decimal(18, 3)
+  meterSalesAmount Decimal @default(0) @db.Decimal(18, 2)
+
+  notes           String?
+  emergencyReason String?
+  openedById      String
+  closedById      String?
+
+  createdBy String?
+  updatedBy String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  branch      Branch      @relation(fields: [branchId], references: [id], onDelete: Restrict)
+  businessDay BusinessDay @relation(fields: [businessDayId], references: [id], onDelete: Restrict)
+  openedBy    User        @relation("StationShiftOpenedBy", fields: [openedById], references: [id], onDelete: Restrict)
+  closedBy    User?       @relation("StationShiftClosedBy", fields: [closedById], references: [id], onDelete: Restrict)
+  readings    NozzleReading[]
+
+  @@unique([businessDayId, shiftNumber])
+  @@index([branchId, status])
+  @@index([businessDayId, status])
+  @@index([openedAt])
+}
+
+// ─── Phase 5B: Nozzle meter readings & calculated sales ─
+model NozzleReading {
+  id             String              @id @default(cuid())
+  stationShiftId String
+  nozzleId       String
+  status         NozzleReadingStatus @default(OPEN)
+
+  openingReading   Decimal  @db.Decimal(18, 3)
+  closingReading   Decimal? @db.Decimal(18, 3)
+  unitPrice        Decimal  @db.Decimal(18, 3)
+  testLitres       Decimal  @default(0) @db.Decimal(18, 3)
+  adjustmentLitres Decimal  @default(0) @db.Decimal(18, 3)
+  netSalesLitres   Decimal  @default(0) @db.Decimal(18, 3)
+  salesAmount      Decimal  @default(0) @db.Decimal(18, 2)
+
+  createdBy String?
+  updatedBy String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  stationShift StationShift @relation(fields: [stationShiftId], references: [id], onDelete: Cascade)
+  nozzle       Nozzle       @relation(fields: [nozzleId], references: [id], onDelete: Restrict)
+
+  @@unique([stationShiftId, nozzleId])
+  @@index([nozzleId])
+  @@index([stationShiftId, status])
+}
+
 // ─── Loyverse Integration (Phase 3A: OAuth + token storage) ────
 // One Loyverse "store" maps to exactly one Branch. OAuth consent in
 // Loyverse is granted at the merchant level (not store-scoped), so the
@@ -433,7 +552,7 @@ enum LoyverseConnectionStatus {
 model LoyverseConnection {
   id String @id @default(cuid())
 
-  branchId String @unique
+  branchId String
   branch   Branch @relation(fields: [branchId], references: [id], onDelete: Cascade)
 
   // Loyverse-side store identity (set once the admin confirms the mapping)
@@ -467,6 +586,7 @@ model LoyverseConnection {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
+  @@unique([branchId])
   @@unique([storeId])
   @@index([status])
 }
@@ -566,7 +686,7 @@ model InvoicePayment {
 
   loyversePaymentTypeId String?
   paymentTypeName       String?
-  moneyAmount           Decimal   @db.Decimal(18, 2)
+  moneyAmount           Decimal  @db.Decimal(18, 2)
   paidAt                DateTime?
 
   createdAt DateTime @default(now())
